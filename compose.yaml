@@ -1,0 +1,45 @@
+services:
+  dns-reporter:
+    build:
+      context: .
+      args:
+        APP_UID: "20211"
+        APP_GID: "20211"
+    image: homeshield/dns-reporter:local
+    container_name: dns-reporter
+    restart: unless-stopped
+    user: "20211:20211"
+    group_add:
+      - "1000"
+    environment:
+      DNS_REPORTER_HOST: "0.0.0.0"
+      DNS_REPORTER_PORT: "8080"
+      PIHOLE_DB_PATH: "/sources/pihole/pihole-FTL.db"
+      PIHOLE_GRAVITY_DB_PATH: "/sources/pihole/gravity.db"
+      NETALERTX_DB_PATH: "/sources/netalertx/app.db"
+    ports:
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - /opt/homeshield/data/pihole:/sources/pihole:ro
+      - /opt/homeshield/data/netalertx/db:/sources/netalertx:ro
+      - /etc/localtime:/etc/localtime:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.50
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2).read()"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

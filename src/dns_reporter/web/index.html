@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Homeshield DNS Reporter</title>
+    <link rel="stylesheet" href="/app.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="product-mark">HOMESHIELD</p>
+          <h1>DNS Reporter</h1>
+        </div>
+        <div class="source-state" id="source-state" aria-live="polite">
+          <span class="state-dot"></span>
+          Checking sources
+        </div>
+      </header>
+
+      <section class="control-panel" aria-label="Report controls">
+        <label>
+          <span>Device</span>
+          <select id="device-select" disabled>
+            <option>Loading devices…</option>
+          </select>
+        </label>
+        <fieldset class="range-control">
+          <legend>Time range</legend>
+          <label><input type="radio" name="hours" value="12"> Last 12h</label>
+          <label><input type="radio" name="hours" value="24" checked> Last 24h</label>
+        </fieldset>
+        <button id="generate-button" type="button" disabled>Generate report</button>
+      </section>
+
+      <div class="error-banner" id="error-banner" role="alert" hidden></div>
+      <div class="loading" id="loading" hidden>Reading DNS history…</div>
+
+      <div id="report" hidden>
+        <section class="report-heading">
+          <div>
+            <p class="eyebrow">Selected device</p>
+            <h2 id="device-name"></h2>
+            <p id="device-meta" class="muted"></p>
+          </div>
+          <p id="generated-at" class="muted generated-at"></p>
+        </section>
+
+        <section class="kpi-grid" aria-label="DNS activity overview">
+          <article class="kpi-card">
+            <span>Total queries</span>
+            <strong id="total-queries">—</strong>
+          </article>
+          <article class="kpi-card blocked">
+            <span>Blocked</span>
+            <strong id="blocked-percentage">—</strong>
+            <small id="blocked-queries"></small>
+          </article>
+          <article class="kpi-card">
+            <span>Unique domains</span>
+            <strong id="unique-domains">—</strong>
+          </article>
+          <article class="kpi-card">
+            <span>Identified services</span>
+            <strong id="identified-services">—</strong>
+          </article>
+        </section>
+
+        <section class="summary-card">
+          <p id="summary"></p>
+          <p id="caveat" class="caveat"></p>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel activity-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Frequency</p>
+                <h3>DNS activity</h3>
+              </div>
+              <span id="timeline-range" class="chip"></span>
+            </div>
+            <div id="activity-chart" class="timeline-chart" role="img"></div>
+          </article>
+
+          <article class="panel services-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Classification</p>
+                <h3>Top services</h3>
+              </div>
+              <span class="chip">Click to inspect</span>
+            </div>
+            <div id="services-list" class="services-list"></div>
+          </article>
+        </section>
+
+        <section class="panel detail-panel" id="detail-panel" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow" id="detail-category"></p>
+              <h3 id="detail-title"></h3>
+            </div>
+            <button type="button" class="close-button" id="close-detail">Close</button>
+          </div>
+          <div class="detail-metrics" id="detail-metrics"></div>
+          <div id="service-chart" class="timeline-chart compact" role="img"></div>
+          <div class="domain-list" id="domain-list"></div>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

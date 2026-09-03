@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "service": "YouTube",
+      "company": "Google",
+      "category": "Video / Streaming",
+      "confidence": "high",
+      "suffixes": ["youtube.com", "youtu.be", "ytimg.com", "googlevideo.com", "youtube-nocookie.com"]
+    },
+    {
+      "service": "WhatsApp",
+      "company": "Meta",
+      "category": "Messaging",
+      "confidence": "high",
+      "suffixes": ["whatsapp.com", "whatsapp.net"]
+    },
+    {
+      "service": "Meta / Instagram",
+      "company": "Meta",
+      "category": "Social",
+      "confidence": "high",
+      "suffixes": ["facebook.com", "facebook.net", "fbcdn.net", "instagram.com", "cdninstagram.com", "threads.net"]
+    },
+    {
+      "service": "Apple",
+      "company": "Apple",
+      "category": "System / Cloud",
+      "confidence": "high",
+      "suffixes": ["apple.com", "icloud.com", "apple-dns.net", "mzstatic.com", "me.com"]
+    },
+    {
+      "service": "Google",
+      "company": "Google",
+      "category": "Search / Cloud",
+      "confidence": "likely",
+      "suffixes": ["google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "ggpht.com"]
+    },
+    {
+      "service": "Microsoft",
+      "company": "Microsoft",
+      "category": "Productivity / System",
+      "confidence": "likely",
+      "suffixes": ["microsoft.com", "microsoftonline.com", "windows.com", "office.com", "office.net", "live.com", "xboxlive.com"]
+    },
+    {
+      "service": "Amazon",
+      "company": "Amazon",
+      "category": "Shopping / Media",
+      "confidence": "likely",
+      "suffixes": ["amazon.com", "amazon.it", "amazonvideo.com", "media-amazon.com"]
+    },
+    {
+      "service": "Advertising / Tracking",
+      "company": "Various",
+      "category": "Advertising / Analytics",
+      "confidence": "likely",
+      "suffixes": ["doubleclick.net", "googlesyndication.com", "googleadservices.com", "app-measurement.com", "scorecardresearch.com"]
+    },
+    {
+      "service": "Amazon Web Services",
+      "company": "Amazon",
+      "category": "Cloud / Infrastructure",
+      "confidence": "infrastructure",
+      "suffixes": ["amazonaws.com", "cloudfront.net"]
+    },
+    {
+      "service": "Cloudflare",
+      "company": "Cloudflare",
+      "category": "CDN / Infrastructure",
+      "confidence": "infrastructure",
+      "suffixes": ["cloudflare.com", "cloudflare-dns.com", "workers.dev"]
+    },
+    {
+      "service": "Akamai",
+      "company": "Akamai",
+      "category": "CDN / Infrastructure",
+      "confidence": "infrastructure",
+      "suffixes": ["akamai.net", "akamaiedge.net", "akamaitechnologies.com", "edgesuite.net"]
+    }
+  ]
+}
