@@ -59,9 +59,15 @@ class NetAlertXSource:
 
 
 class PiHoleSource:
-    def __init__(self, database_path: Path, netalertx: NetAlertXSource) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        netalertx: NetAlertXSource,
+        gravity_database_path: Path | None = None,
+    ) -> None:
         self.database_path = database_path
         self.netalertx = netalertx
+        self.gravity_database_path = gravity_database_path
 
     def list_devices(self, lookback_hours: int = 168) -> list[dict[str, object]]:
         cutoff = time.time() - lookback_hours * 3600
@@ -116,23 +122,185 @@ class PiHoleSource:
                 return device
         return None
 
-    def query_rows(self, client: str, hours: int) -> list[dict[str, object]]:
-        cutoff = time.time() - hours * 3600
+    def resolve_devices(self, opaque_ids: list[str]) -> list[dict[str, object]]:
+        requested = set(opaque_ids)
+        return [device for device in self.list_devices() if device["id"] in requested]
+
+    def list_groups(
+        self, devices: list[dict[str, object]] | None = None
+    ) -> list[dict[str, object]]:
+        if self.gravity_database_path is None:
+            return []
+
+        devices = devices if devices is not None else self.list_devices()
+        hardware_by_address = self._hardware_by_address()
+        try:
+            with connect_readonly(self.gravity_database_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT g.id, g.name, COALESCE(g.description, '') AS description,
+                           c.ip AS selector
+                    FROM "group" AS g
+                    LEFT JOIN client_by_group AS cbg ON cbg.group_id = g.id
+                    LEFT JOIN client AS c ON c.id = cbg.client_id
+                    WHERE g.enabled = 1
+                    ORDER BY LOWER(g.name), c.ip
+                    """
+                ).fetchall()
+        except (SourceUnavailable, sqlite3.Error):
+            return []
+
+        grouped: dict[int, dict[str, object]] = {}
+        for row in rows:
+            numeric_id = int(row["id"])
+            group = grouped.setdefault(
+                numeric_id,
+                {
+                    "id": group_id(numeric_id),
+                    "display_name": str(row["name"]),
+                    "description": str(row["description"]),
+                    "selectors": [],
+                },
+            )
+            if row["selector"]:
+                group["selectors"].append(str(row["selector"]))  # type: ignore[union-attr]
+
+        result: list[dict[str, object]] = []
+        for group in grouped.values():
+            selectors = list(group.pop("selectors"))
+            member_ids = [
+                str(device["id"])
+                for device in devices
+                if any(
+                    _selector_matches(
+                        selector,
+                        str(device["address"]),
+                        hardware_by_address.get(
+                            _normalize_address(str(device["address"])), ""
+                        ),
+                    )
+                    for selector in selectors
+                )
+            ]
+            result.append(
+                {
+                    **group,
+                    "device_ids": member_ids,
+                    "device_count": len(member_ids),
+                }
+            )
+        return result
+
+    def resolve_group(self, opaque_id: str) -> dict[str, object] | None:
+        for group in self.list_groups():
+            if group["id"] == opaque_id:
+                return group
+        return None
+
+    def query_rows(
+        self,
+        clients: list[str],
+        hours: int,
+        end_time: float | None = None,
+    ) -> list[dict[str, object]]:
+        unique_clients = list(dict.fromkeys(clients))
+        if not unique_clients or len(unique_clients) > 64:
+            raise ValueError("between 1 and 64 clients are required")
+        end = end_time or time.time()
+        cutoff = end - hours * 3600
+        placeholders = ",".join("?" for _ in unique_clients)
         with connect_readonly(self.database_path) as connection:
             rows = connection.execute(
-                """
-                SELECT timestamp, status, domain
+                f"""
+                SELECT timestamp, status, domain, client
                 FROM queries
-                WHERE timestamp >= ? AND client = ?
+                WHERE timestamp >= ? AND timestamp <= ?
+                  AND client IN ({placeholders})
                 ORDER BY timestamp
                 """,
-                (cutoff, client),
+                (cutoff, end, *unique_clients),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def historical_context(
+        self,
+        clients: list[str],
+        hours: int,
+        end_time: float,
+        baseline_days: int = 7,
+    ) -> dict[str, object]:
+        unique_clients = list(dict.fromkeys(clients))
+        if not unique_clients or len(unique_clients) > 64:
+            raise ValueError("between 1 and 64 clients are required")
+        current_start = end_time - hours * 3600
+        baseline_start = current_start - baseline_days * 86400
+        placeholders = ",".join("?" for _ in unique_clients)
+        parameters = (baseline_start, current_start, *unique_clients)
+        with connect_readonly(self.database_path) as connection:
+            domain_rows = connection.execute(
+                f"""
+                SELECT domain, COUNT(*) AS query_count
+                FROM queries
+                WHERE timestamp >= ? AND timestamp < ?
+                  AND client IN ({placeholders})
+                GROUP BY domain
+                """,
+                parameters,
+            ).fetchall()
+            hour_rows = connection.execute(
+                f"""
+                SELECT CAST(timestamp / 3600 AS INTEGER) AS hour_bucket,
+                       COUNT(*) AS query_count
+                FROM queries
+                WHERE timestamp >= ? AND timestamp < ?
+                  AND client IN ({placeholders})
+                GROUP BY hour_bucket
+                ORDER BY hour_bucket
+                """,
+                parameters,
+            ).fetchall()
+        return {
+            "baseline_days": baseline_days,
+            "start": baseline_start,
+            "end": current_start,
+            "domain_counts": {
+                str(row["domain"] or "").lower().rstrip("."): int(row["query_count"])
+                for row in domain_rows
+                if row["domain"]
+            },
+            "hour_counts": [
+                {
+                    "timestamp": int(row["hour_bucket"]) * 3600,
+                    "queries": int(row["query_count"]),
+                }
+                for row in hour_rows
+            ],
+        }
+
+    def _hardware_by_address(self) -> dict[str, str]:
+        try:
+            with connect_readonly(self.database_path) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT a.ip, n.hwaddr
+                    FROM network_addresses AS a
+                    JOIN network AS n ON n.id = a.network_id
+                    """
+                ).fetchall()
+        except (SourceUnavailable, sqlite3.Error):
+            return {}
+        return {
+            _normalize_address(str(row["ip"])): str(row["hwaddr"] or "").lower()
+            for row in rows
+        }
 
 
 def device_id(address: str) -> str:
     return hashlib.sha256(address.encode("utf-8")).hexdigest()[:16]
+
+
+def group_id(numeric_id: int) -> str:
+    return hashlib.sha256(f"group:{numeric_id}".encode("utf-8")).hexdigest()[:16]
 
 
 def _clean_name(value: object) -> str:
@@ -166,3 +334,18 @@ def _extract_addresses(*values: object) -> set[str]:
                 continue
             addresses.add(normalized)
     return addresses
+
+
+def _selector_matches(selector: str, address: str, hardware_address: str) -> bool:
+    candidate = selector.strip().lower()
+    normalized_address = _normalize_address(address)
+    if candidate == hardware_address.lower() and hardware_address:
+        return True
+    try:
+        if "/" in candidate:
+            return ipaddress.ip_address(normalized_address) in ipaddress.ip_network(
+                candidate, strict=False
+            )
+        return ipaddress.ip_address(candidate) == ipaddress.ip_address(normalized_address)
+    except ValueError:
+        return candidate == normalized_address.lower()

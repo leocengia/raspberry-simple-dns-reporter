@@ -22,17 +22,40 @@
       </header>
 
       <section class="control-panel" aria-label="Report controls">
-        <label>
-          <span>Device</span>
-          <select id="device-select" disabled>
-            <option>Loading devices…</option>
+        <div class="scope-control">
+          <span class="control-label">Report scope</span>
+          <div class="scope-tabs" role="radiogroup" aria-label="Report scope">
+            <label><input type="radio" name="scope" value="devices" checked> Devices</label>
+            <label><input type="radio" name="scope" value="group"> Pi-hole group</label>
+          </div>
+          <div id="devices-control">
+            <div class="selection-actions">
+              <button type="button" id="select-all">Select all</button>
+              <button type="button" id="clear-selection">Clear</button>
+            </div>
+            <div id="device-list" class="device-list" aria-label="Devices">
+              <span class="muted">Loading devices…</span>
+            </div>
+          </div>
+          <label id="group-control" hidden>
+            <span>Pi-hole group</span>
+            <select id="group-select" disabled>
+              <option>Loading groups…</option>
+            </select>
+            <small id="group-hint" class="muted"></small>
+          </label>
+        </div>
+        <label class="time-control">
+          <span>Time range</span>
+          <select id="hours-select">
+            <option value="3">Last 3h</option>
+            <option value="6">Last 6h</option>
+            <option value="12">Last 12h</option>
+            <option value="24" selected>Last 24h</option>
+            <option value="48">Last 48h</option>
+            <option value="168">Last 7 days</option>
           </select>
         </label>
-        <fieldset class="range-control">
-          <legend>Time range</legend>
-          <label><input type="radio" name="hours" value="12"> Last 12h</label>
-          <label><input type="radio" name="hours" value="24" checked> Last 24h</label>
-        </fieldset>
         <button id="generate-button" type="button" disabled>Generate report</button>
       </section>
 
@@ -42,11 +65,18 @@
       <div id="report" hidden>
         <section class="report-heading">
           <div>
-            <p class="eyebrow">Selected device</p>
+            <p class="eyebrow" id="scope-type">Selected device</p>
             <h2 id="device-name"></h2>
             <p id="device-meta" class="muted"></p>
           </div>
-          <p id="generated-at" class="muted generated-at"></p>
+          <div class="report-actions">
+            <p id="generated-at" class="muted generated-at"></p>
+            <div>
+              <button type="button" id="download-json">JSON</button>
+              <button type="button" id="download-csv">CSV</button>
+              <button type="button" id="print-report">Print / PDF</button>
+            </div>
+          </div>
         </section>
 
         <section class="kpi-grid" aria-label="DNS activity overview">
@@ -67,11 +97,31 @@
             <span>Identified services</span>
             <strong id="identified-services">—</strong>
           </article>
+          <article class="kpi-card">
+            <span>New domains</span>
+            <strong id="new-domains">—</strong>
+            <small>vs previous 7 days</small>
+          </article>
+          <article class="kpi-card signal-card">
+            <span>Signals to review</span>
+            <strong id="signal-count">—</strong>
+          </article>
         </section>
 
         <section class="summary-card">
           <p id="summary"></p>
           <p id="caveat" class="caveat"></p>
+        </section>
+
+        <section class="panel changes-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Changes &amp; Red Flags</p>
+              <h3>Signals to review</h3>
+            </div>
+            <span id="baseline-label" class="chip"></span>
+          </div>
+          <div id="signals-list" class="signals-list"></div>
         </section>
 
         <section class="content-grid">
@@ -108,6 +158,10 @@
           </div>
           <div class="detail-metrics" id="detail-metrics"></div>
           <div id="service-chart" class="timeline-chart compact" role="img"></div>
+          <div id="device-comparison" class="device-comparison" hidden>
+            <h4>Device comparison</h4>
+            <div id="device-comparison-list"></div>
+          </div>
           <div class="domain-list" id="domain-list"></div>
         </section>
       </div>

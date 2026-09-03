@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from http import HTTPStatus
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -17,6 +18,7 @@ from .sources import NetAlertXSource, PiHoleSource
 
 
 LOGGER = logging.getLogger("dns-reporter")
+ALLOWED_HOURS = (3, 6, 12, 24, 48, 168)
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -41,7 +43,9 @@ class Application:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         netalertx = NetAlertXSource(settings.netalertx_db)
-        self.pihole = PiHoleSource(settings.pihole_db, netalertx)
+        self.pihole = PiHoleSource(
+            settings.pihole_db, netalertx, settings.gravity_db
+        )
         self.classifier = DomainClassifier.from_file(settings.service_map)
 
     def __call__(
@@ -62,30 +66,75 @@ class Application:
                 )
                 return self._json(start_response, status, health)
             if method == "GET" and path == "/api/devices":
+                devices = self.pihole.list_devices()
                 return self._json(
                     start_response,
                     HTTPStatus.OK,
-                    {"devices": self.pihole.list_devices()},
+                    {
+                        "devices": devices,
+                        "groups": self.pihole.list_groups(devices),
+                    },
                 )
             if method == "POST" and path == "/api/report":
                 payload = self._read_json(environ)
-                device_id = str(payload.get("device_id", ""))
                 hours = int(payload.get("hours", 24))
-                if hours not in (12, 24):
+                if hours not in ALLOWED_HOURS:
                     return self._json(
                         start_response,
                         HTTPStatus.BAD_REQUEST,
-                        {"error": "hours must be 12 or 24"},
+                        {"error": "unsupported time range"},
                     )
-                device = self.pihole.resolve_device(device_id)
-                if device is None:
+                group = None
+                group_identifier = str(payload.get("group_id", ""))
+                if group_identifier:
+                    group = self.pihole.resolve_group(group_identifier)
+                    if group is None:
+                        return self._json(
+                            start_response,
+                            HTTPStatus.NOT_FOUND,
+                            {"error": "group not found"},
+                        )
+                    requested_ids = [str(value) for value in group["device_ids"]]
+                else:
+                    raw_ids = payload.get("device_ids")
+                    if raw_ids is None and payload.get("device_id"):
+                        raw_ids = [payload["device_id"]]
+                    if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= 64:
+                        return self._json(
+                            start_response,
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "select between 1 and 64 devices"},
+                        )
+                    requested_ids = [str(value) for value in raw_ids]
+
+                devices = self.pihole.resolve_devices(requested_ids)
+                if not devices or len(devices) != len(set(requested_ids)):
                     return self._json(
                         start_response,
                         HTTPStatus.NOT_FOUND,
-                        {"error": "device not found"},
+                        {"error": "one or more devices were not found"},
                     )
-                rows = self.pihole.query_rows(str(device["address"]), hours)
-                report = build_report(rows, device, hours, self.classifier)
+                generated_at = time.time()
+                addresses = [str(device["address"]) for device in devices]
+                rows = self.pihole.query_rows(
+                    addresses,
+                    hours,
+                    generated_at,
+                )
+                historical = self.pihole.historical_context(
+                    addresses,
+                    hours,
+                    generated_at,
+                )
+                report = build_report(
+                    rows,
+                    devices,
+                    hours,
+                    self.classifier,
+                    group=group,
+                    generated_at=generated_at,
+                    historical=historical,
+                )
                 return self._json(start_response, HTTPStatus.OK, report)
             if method == "GET" and path in STATIC_FILES:
                 filename, content_type = STATIC_FILES[path]

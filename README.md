@@ -7,12 +7,17 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 ## MVP features
 
 - Device selector based on recent Pi-hole clients
+- Multi-device selection and aggregated reports
+- Pi-hole group selection (exact IP, subnet, and MAC selectors)
 - NetAlertX name, vendor, type, and presence enrichment
-- Last 12 hours / last 24 hours reports
+- 3h, 6h, 12h, 24h, 48h, and 7-day reports
 - Total queries, blocked percentage, and unique domains
 - Domain-to-service classification with confidence labels
 - DNS activity timeline
 - Service drill-down with timeline and top domains
+- Per-service comparison between selected devices
+- Seven-day historical baseline with conservative change signals
+- Browser-side JSON, CSV, and print/PDF export
 - No background analytics, external database, telemetry, or CDN assets
 
 ## Architecture
@@ -66,6 +71,16 @@ Then open `http://127.0.0.1:8088` in your local browser. Exposing the service to
 the LAN or through Tailscale should be an explicit deployment choice, ideally
 behind authentication.
 
+For tailnet-only access while keeping the Docker port bound to loopback, use
+Tailscale Serve:
+
+```sh
+tailscale serve --bg --http=8088 --yes 127.0.0.1:8088
+```
+
+Tailscale prints the MagicDNS URL to open from authorized tailnet devices. The
+traffic remains restricted to the tailnet; do not use Funnel for DNS history.
+
 The container:
 
 - mounts both source directories read-only;
@@ -107,6 +122,23 @@ Rules live in [`src/dns_reporter/config/service_map.json`](src/dns_reporter/conf
 - confidence (`high`, `likely`, `infrastructure`, or `unknown`).
 
 Infrastructure domains such as AWS, Cloudflare, and Akamai are intentionally not attributed to a specific app. Pull requests that improve conservative, source-backed mappings are welcome.
+
+## Changes and review signals
+
+Each report compares the current window with the preceding seven days. Historical
+queries are aggregated inside SQLite instead of being loaded into memory. Signals
+cover domains and identified services absent from the baseline, unusually large
+hourly query spikes, high blocked share, and high unclassified share.
+
+These are review thresholds, not threat detections. A "new" item means not seen
+in the seven-day baseline for the selected scope; it does not mean the domain has
+never existed or is malicious.
+
+## Export behavior
+
+JSON, CSV, and print/PDF outputs are created by the browser from the report already
+received. The server does not persist generated reports or create export files on
+the Raspberry Pi.
 
 ## Security and privacy
 

@@ -1,6 +1,6 @@
 [project]
 name = "raspberry-simple-dns-reporter"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight, read-only Pi-hole DNS activity reporter with NetAlertX enrichment."
 readme = "README.md"
 requires-python = ">=3.11"
