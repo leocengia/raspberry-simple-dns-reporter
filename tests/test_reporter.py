@@ -274,10 +274,13 @@ class ReporterTestCase(unittest.TestCase):
             historical=historical,
         )
         self.assertEqual(report["overview"]["new_domains"], 1)
-        self.assertIn(
-            "new_domains",
-            {signal["kind"] for signal in report["changes"]["signals"]},
+        signal = next(
+            signal
+            for signal in report["changes"]["signals"]
+            if signal["kind"] == "new_domains"
         )
+        self.assertIn("first_seen", signal["domains"][0])
+        self.assertIn("1 domain was not observed", report["summary"])
 
 
 if __name__ == "__main__":

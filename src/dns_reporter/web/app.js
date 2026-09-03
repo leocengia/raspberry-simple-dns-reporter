@@ -133,7 +133,7 @@ function renderSignals(changes) {
     const values = signal.domains
       ? signal.domains.map((domain) => {
           const firstSeen = domain.first_seen
-            ? ` · first ${dateFormat.format(new Date(domain.first_seen))}`
+            ? ` · first in window ${dateFormat.format(new Date(domain.first_seen))}`
             : "";
           return `${domain.domain} · ${numberFormat.format(domain.queries)}${firstSeen}`;
         })

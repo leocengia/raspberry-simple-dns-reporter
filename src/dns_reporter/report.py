@@ -224,16 +224,40 @@ def _summary(
         return f"No DNS activity was recorded for {name} in the last {period}."
 
     leading = [
-        str(service["service"])
+        service
         for service in services
         if service["confidence"] != "unknown"
     ][:3]
-    service_text = ", ".join(leading) if leading else "unclassified domains"
+    service_text = (
+        ", ".join(str(service["service"]) for service in leading)
+        if leading
+        else "unclassified domains"
+    )
     base = (
         f"In the last {period}, {name} generated {total:,} DNS queries. "
         f"{overview['blocked_percentage']}% were blocked. "
         f"The main identifiable services were {service_text}."
     )
+    if leading:
+        primary = leading[0]
+        peak = max(
+            primary["timeline"],
+            key=lambda point: int(point["queries"]),
+            default=None,
+        )
+        if peak and int(peak["queries"]):
+            base += (
+                f" {primary['service']} had its highest DNS-request bucket around "
+                f"{peak['label']} ({int(peak['queries']):,} queries)."
+            )
+    if changes["baseline_days"]:
+        new_domain_count = int(overview["new_domains"])
+        noun = "domain" if new_domain_count == 1 else "domains"
+        verb = "was" if new_domain_count == 1 else "were"
+        base += (
+            f" {new_domain_count:,} {noun} {verb} not observed in the "
+            f"preceding {changes['baseline_days']} days."
+        )
     signal_count = len(changes["signals"])  # type: ignore[arg-type]
     if signal_count:
         return (
