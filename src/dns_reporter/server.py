@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import time
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -12,8 +14,12 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from .classifier import DomainClassifier
 from .database import SourceUnavailable
+from .evidence import EvidenceSpec
+from .events import ROME, QueryEvent, normalize_event
+from .exports import safe_fragment, stream_csv, stream_jsonl
 from .report import build_report
 from .settings import Settings
+from .snapshots import InvalidSnapshot, SnapshotSigner
 from .sources import NetAlertXSource, PiHoleSource
 
 
@@ -47,6 +53,7 @@ class Application:
             settings.pihole_db, netalertx, settings.gravity_db
         )
         self.classifier = DomainClassifier.from_file(settings.service_map)
+        self.snapshots = SnapshotSigner.ephemeral()
 
     def __call__(
         self,
@@ -115,10 +122,14 @@ class Application:
                         {"error": "one or more devices were not found"},
                     )
                 generated_at = time.time()
-                addresses = [str(device["address"]) for device in devices]
-                rows = self.pihole.query_rows(
+                addresses = [
+                    str(address)
+                    for device in devices
+                    for address in list(device.get("addresses") or [device["address"]])
+                ]
+                rows = self.pihole.query_range(
                     addresses,
-                    hours,
+                    generated_at - hours * 3600,
                     generated_at,
                 )
                 historical = self.pihole.historical_context(
@@ -135,12 +146,25 @@ class Application:
                     generated_at=generated_at,
                     historical=historical,
                 )
+                self._attach_snapshot(report, devices, addresses)
                 return self._json(start_response, HTTPStatus.OK, report)
+            if method == "POST" and path == "/api/queries":
+                payload = self._read_json(environ)
+                snapshot = self._validate_snapshot(str(payload.get("snapshot_token", "")))
+                return self._query_page(start_response, payload, snapshot)
+            if method == "POST" and path == "/api/exports/queries":
+                payload = self._read_json(environ, max_length=131072)
+                snapshot = self._validate_snapshot(str(payload.get("snapshot_token", "")))
+                return self._export(start_response, payload, snapshot)
             if method == "GET" and path in STATIC_FILES:
                 filename, content_type = STATIC_FILES[path]
                 return self._file(start_response, filename, content_type)
             return self._json(
                 start_response, HTTPStatus.NOT_FOUND, {"error": "not found"}
+            )
+        except InvalidSnapshot as exc:
+            return self._json(
+                start_response, HTTPStatus.CONFLICT, {"error": str(exc)}
             )
         except (ValueError, json.JSONDecodeError):
             return self._json(
@@ -152,6 +176,13 @@ class Application:
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": str(exc)},
+            )
+        except sqlite3.Error:
+            LOGGER.warning("data source temporarily busy")
+            return self._json(
+                start_response,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Data source temporarily busy; try again shortly"},
             )
         except Exception:
             LOGGER.exception("request failed")
@@ -170,9 +201,11 @@ class Application:
         return {"status": "ok" if all(sources.values()) else "degraded", "sources": sources}
 
     @staticmethod
-    def _read_json(environ: dict[str, object]) -> dict[str, object]:
+    def _read_json(
+        environ: dict[str, object], *, max_length: int = 65536
+    ) -> dict[str, object]:
         length = int(environ.get("CONTENT_LENGTH") or 0)
-        if length < 1 or length > 4096:
+        if length < 1 or length > max_length:
             raise ValueError("invalid content length")
         stream = environ["wsgi.input"]
         payload = json.loads(stream.read(length).decode("utf-8"))  # type: ignore[union-attr]
@@ -180,11 +213,247 @@ class Application:
             raise ValueError("JSON object required")
         return payload
 
+    def _attach_snapshot(
+        self,
+        report: dict[str, object],
+        devices: list[dict[str, object]],
+        addresses: list[str],
+    ) -> None:
+        changes = report["changes"]
+        services = report["services"]
+        signal_snapshots = []
+        for signal in changes["signals"]:  # type: ignore[index,union-attr]
+            signal_snapshots.append(
+                {
+                    "signal_id": signal["signal_id"],
+                    "kind": signal["kind"],
+                    "title": signal["title"],
+                    "query_count": signal["query_count"],
+                    "evidence": signal.pop("evidence"),
+                }
+            )
+        snapshot = {
+            "version": 1,
+            "context": report["report_context"],
+            "clients": addresses,
+            "devices": [
+                {
+                    "id": device["id"],
+                    "display_name": device["display_name"],
+                    "identity_confidence": device.get("identity_confidence", "low"),
+                    "addresses": list(device.get("addresses") or [device["address"]]),
+                }
+                for device in devices
+            ],
+            "signals": signal_snapshots,
+            "services": [
+                {
+                    "service_id": service["service_id"],
+                    "service_name": service["service_name"],
+                    "query_count": service["queries"],
+                }
+                for service in services  # type: ignore[union-attr]
+            ],
+        }
+        report["snapshot_token"] = self.snapshots.sign(snapshot)
+
+    def _validate_snapshot(self, token: str) -> dict[str, object]:
+        snapshot = self.snapshots.verify(token)
+        context = snapshot.get("context")
+        if not isinstance(context, dict):
+            raise InvalidSnapshot("invalid report snapshot")
+        if context.get("classification_version") != self.classifier.version:
+            raise InvalidSnapshot("classification changed; generate a new report")
+        hours = int(context.get("hours", 0))
+        start = float(context.get("report_start_epoch", 0))
+        end = float(context.get("report_end_epoch", 0))
+        if hours not in ALLOWED_HOURS or abs((end - start) - hours * 3600) > 1:
+            raise InvalidSnapshot("invalid report snapshot")
+        return snapshot
+
+    def _event_iterator(
+        self, snapshot: dict[str, object], *, descending: bool
+    ) -> Iterable[QueryEvent]:
+        context = snapshot["context"]
+        devices = snapshot["devices"]
+        devices_by_address = {
+            str(address): device
+            for device in devices  # type: ignore[union-attr]
+            for address in device["addresses"]
+        }
+        rows = self.pihole.query_range(
+            [str(client) for client in snapshot["clients"]],  # type: ignore[index]
+            float(context["report_start_epoch"]),  # type: ignore[index]
+            float(context["report_end_epoch"]),  # type: ignore[index]
+            descending=descending,
+        )
+        for row in rows:  # type: ignore[union-attr]
+            event = normalize_event(row, devices_by_address, self.classifier)
+            if event is not None:
+                yield event
+
+    @staticmethod
+    def _selection(
+        payload: dict[str, object], snapshot: dict[str, object]
+    ) -> tuple[str, object, str]:
+        scope = str(payload.get("scope", ""))
+        selector = payload.get("selector")
+        if not isinstance(selector, dict):
+            raise ValueError("selector required")
+        if scope == "service":
+            service_id = str(selector.get("service_id", ""))
+            service = next(
+                (item for item in snapshot["services"] if item["service_id"] == service_id),  # type: ignore[index]
+                None,
+            )
+            if service is None:
+                raise ValueError("unknown service")
+            return scope, service_id, str(service["service_name"])
+        if scope == "signal":
+            identifier = str(selector.get("signal_id", ""))
+            signal = next(
+                (item for item in snapshot["signals"] if item["signal_id"] == identifier),  # type: ignore[index]
+                None,
+            )
+            if signal is None:
+                raise InvalidSnapshot("signal is not part of this report; generate a new report")
+            return scope, EvidenceSpec.from_dict(signal["evidence"]), str(signal["title"])
+        if scope == "all_signals" and snapshot["signals"]:
+            return scope, None, "all"
+        raise ValueError("unsupported query scope")
+
+    @staticmethod
+    def _memberships(
+        event: QueryEvent, snapshot: dict[str, object]
+    ) -> list[dict[str, object]]:
+        return [
+            signal
+            for signal in snapshot["signals"]  # type: ignore[index]
+            if EvidenceSpec.from_dict(signal["evidence"]).matches(event)
+        ]
+
+    def _matching_events(
+        self,
+        payload: dict[str, object],
+        snapshot: dict[str, object],
+        *,
+        descending: bool,
+    ):
+        scope, selection, _ = self._selection(payload, snapshot)
+        domain_filter = str(payload.get("domain_filter", "")).strip().lower()
+        if len(domain_filter) > 200:
+            raise ValueError("domain filter too long")
+        device_filter = str(payload.get("device_id", ""))
+        known_device_ids = {str(item["id"]) for item in snapshot["devices"]}  # type: ignore[index]
+        if device_filter and device_filter not in known_device_ids:
+            raise ValueError("unknown device")
+        for event in self._event_iterator(snapshot, descending=descending):
+            memberships = self._memberships(event, snapshot) if scope in {"signal", "all_signals"} else []
+            selected = (
+                event.service_id == selection if scope == "service"
+                else bool(memberships) if scope == "all_signals"
+                else selection.matches(event)
+            )
+            if not selected or (domain_filter and domain_filter not in event.domain):
+                continue
+            if device_filter and event.canonical_device_id != device_filter:
+                continue
+            yield event, memberships
+
+    def _query_page(
+        self,
+        start_response: Callable[..., object],
+        payload: dict[str, object],
+        snapshot: dict[str, object],
+    ) -> list[bytes]:
+        limit = int(payload.get("limit", 50))
+        offset = int(payload.get("offset", 0))
+        sort = str(payload.get("sort", "desc"))
+        if not 1 <= limit <= 100 or not 0 <= offset <= 1_000_000 or sort not in {"asc", "desc"}:
+            raise ValueError("invalid pagination")
+        rows: list[dict[str, object]] = []
+        total = 0
+        context = snapshot["context"]
+        unfiltered = not str(payload.get("domain_filter", "")).strip() and not str(payload.get("device_id", ""))
+        expected_total = self._expected_count(payload, snapshot) if unfiltered else None
+        for event, memberships in self._matching_events(
+            payload, snapshot, descending=sort == "desc"
+        ):
+            if offset <= total < offset + limit:
+                row = event.export_dict(
+                    context,  # type: ignore[arg-type]
+                    [str(item["signal_id"]) for item in memberships],
+                    [str(item["title"]) for item in memberships],
+                )
+                rows.append(row)
+            total += 1
+            if expected_total is not None and len(rows) == limit:
+                break
+        if expected_total is not None:
+            total = expected_total
+        return self._json(
+            start_response, HTTPStatus.OK,
+            {"rows": rows, "total": total, "offset": offset, "limit": limit, "has_more": offset + len(rows) < total},
+        )
+
+    @staticmethod
+    def _expected_count(
+        payload: dict[str, object], snapshot: dict[str, object]
+    ) -> int | None:
+        scope = str(payload.get("scope", ""))
+        selector = payload.get("selector")
+        if not isinstance(selector, dict):
+            return None
+        if scope == "service":
+            identifier = str(selector.get("service_id", ""))
+            item = next((item for item in snapshot["services"] if item["service_id"] == identifier), None)  # type: ignore[index]
+            return int(item["query_count"]) if item else None
+        if scope == "signal":
+            identifier = str(selector.get("signal_id", ""))
+            item = next((item for item in snapshot["signals"] if item["signal_id"] == identifier), None)  # type: ignore[index]
+            return int(item["query_count"]) if item else None
+        return None
+
+    def _export(
+        self,
+        start_response: Callable[..., object],
+        payload: dict[str, object],
+        snapshot: dict[str, object],
+    ) -> Iterable[bytes]:
+        export_format = str(payload.get("format", ""))
+        if export_format not in {"csv", "jsonl"}:
+            raise ValueError("unsupported export format")
+        scope, _, label = self._selection(payload, snapshot)
+        context = snapshot["context"]
+
+        def rows():
+            for event, memberships in self._matching_events(payload, snapshot, descending=False):
+                yield event.export_dict(
+                    context,  # type: ignore[arg-type]
+                    [str(item["signal_id"]) for item in memberships],
+                    [str(item["title"]) for item in memberships],
+                )
+
+        start = datetime.fromtimestamp(float(context["report_start_epoch"]), ROME).strftime("%Y%m%dT%H%M%z")
+        end = datetime.fromtimestamp(float(context["report_end_epoch"]), ROME).strftime("%Y%m%dT%H%M%z")
+        prefix = "red-flags" if scope == "all_signals" else "red-flag" if scope == "signal" else "service"
+        filename = f"homeshield_{prefix}_{safe_fragment(label)}_{start}_{end}.{export_format}"
+        content_type = "text/csv; charset=utf-8" if export_format == "csv" else "application/x-ndjson; charset=utf-8"
+        headers = self._security_headers(content_type)
+        headers.append(("Content-Disposition", f'attachment; filename="{filename}"'))
+        start_response("200 OK", headers)
+        return stream_csv(rows()) if export_format == "csv" else stream_jsonl(rows())
+
     @staticmethod
     def _headers(content_type: str, length: int) -> list[tuple[str, str]]:
+        return Application._security_headers(content_type) + [
+            ("Content-Length", str(length)),
+        ]
+
+    @staticmethod
+    def _security_headers(content_type: str) -> list[tuple[str, str]]:
         return [
             ("Content-Type", content_type),
-            ("Content-Length", str(length)),
             ("Cache-Control", "no-store"),
             ("X-Content-Type-Options", "nosniff"),
             ("X-Frame-Options", "DENY"),
