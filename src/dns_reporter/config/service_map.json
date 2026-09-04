@@ -1,7 +1,17 @@
 {
-  "version": 1,
+  "version": "2026-09-04.2",
   "rules": [
     {
+      "id": "apple-itunes-akamai",
+      "service": "Apple / iTunes",
+      "company": "Apple",
+      "category": "Apple Services",
+      "confidence": "likely",
+      "infrastructure_provider": "Akamai",
+      "suffixes": ["itunes-apple.com.akadns.net"]
+    },
+    {
+      "id": "youtube",
       "service": "YouTube",
       "company": "Google",
       "category": "Video / Streaming",
@@ -9,6 +19,7 @@
       "suffixes": ["youtube.com", "youtu.be", "ytimg.com", "googlevideo.com", "youtube-nocookie.com"]
     },
     {
+      "id": "whatsapp",
       "service": "WhatsApp",
       "company": "Meta",
       "category": "Messaging",
@@ -16,6 +27,7 @@
       "suffixes": ["whatsapp.com", "whatsapp.net"]
     },
     {
+      "id": "meta-instagram",
       "service": "Meta / Instagram",
       "company": "Meta",
       "category": "Social",
@@ -23,6 +35,7 @@
       "suffixes": ["facebook.com", "facebook.net", "fbcdn.net", "instagram.com", "cdninstagram.com", "threads.net"]
     },
     {
+      "id": "apple",
       "service": "Apple",
       "company": "Apple",
       "category": "System / Cloud",
@@ -30,6 +43,7 @@
       "suffixes": ["apple.com", "icloud.com", "apple-dns.net", "mzstatic.com", "me.com"]
     },
     {
+      "id": "google",
       "service": "Google",
       "company": "Google",
       "category": "Search / Cloud",
@@ -37,6 +51,7 @@
       "suffixes": ["google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "ggpht.com"]
     },
     {
+      "id": "microsoft",
       "service": "Microsoft",
       "company": "Microsoft",
       "category": "Productivity / System",
@@ -44,6 +59,7 @@
       "suffixes": ["microsoft.com", "microsoftonline.com", "windows.com", "office.com", "office.net", "live.com", "xboxlive.com"]
     },
     {
+      "id": "amazon",
       "service": "Amazon",
       "company": "Amazon",
       "category": "Shopping / Media",
@@ -51,6 +67,7 @@
       "suffixes": ["amazon.com", "amazon.it", "amazonvideo.com", "media-amazon.com"]
     },
     {
+      "id": "advertising-tracking",
       "service": "Advertising / Tracking",
       "company": "Various",
       "category": "Advertising / Analytics",
@@ -58,25 +75,31 @@
       "suffixes": ["doubleclick.net", "googlesyndication.com", "googleadservices.com", "app-measurement.com", "scorecardresearch.com"]
     },
     {
+      "id": "aws-infrastructure",
       "service": "Amazon Web Services",
       "company": "Amazon",
       "category": "Cloud / Infrastructure",
       "confidence": "infrastructure",
+      "infrastructure_provider": "Amazon Web Services",
       "suffixes": ["amazonaws.com", "cloudfront.net"]
     },
     {
+      "id": "cloudflare-infrastructure",
       "service": "Cloudflare",
       "company": "Cloudflare",
       "category": "CDN / Infrastructure",
       "confidence": "infrastructure",
+      "infrastructure_provider": "Cloudflare",
       "suffixes": ["cloudflare.com", "cloudflare-dns.com", "workers.dev"]
     },
     {
-      "service": "Akamai",
+      "id": "akamai-infrastructure",
+      "service": "Akamai CDN (shared infrastructure)",
       "company": "Akamai",
       "category": "CDN / Infrastructure",
-      "confidence": "infrastructure",
-      "suffixes": ["akamai.net", "akamaiedge.net", "akamaitechnologies.com", "edgesuite.net"]
+      "confidence": "infrastructure/ambiguous",
+      "infrastructure_provider": "Akamai",
+      "suffixes": ["akamai.net", "akamaiedge.net", "akamaitechnologies.com", "edgesuite.net", "akadns.net"]
     }
   ]
 }
