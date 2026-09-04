@@ -15,6 +15,9 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 - Domain-to-service classification with confidence labels
 - DNS activity timeline
 - Service drill-down with timeline and top domains
+- Timestamped, paginated raw-query drill-down for services and review signals
+- Streaming CSV and JSONL evidence exports for a service, one signal, or all signals
+- Stable device identity with safe disambiguation of duplicate display names
 - Per-service comparison between selected devices
 - Seven-day historical baseline with conservative change signals
 - Browser-side JSON, CSV, and print/PDF export
@@ -34,7 +37,7 @@ Browser
   <- HTML, JSON, CSS and JavaScript
 ```
 
-Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata.
+Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
 
 ## Requirements
 
@@ -116,12 +119,18 @@ Blocked counts follow Pi-hole's documented status values rather than assuming ev
 
 Rules live in [`src/dns_reporter/config/service_map.json`](src/dns_reporter/config/service_map.json). A rule maps domain suffixes to:
 
+- stable service and rule IDs;
 - service;
 - company;
 - category;
-- confidence (`high`, `likely`, `infrastructure`, or `unknown`).
+- confidence (`high`, `likely`, `infrastructure/ambiguous`, or `unknown`);
+- an optional infrastructure provider.
 
-Infrastructure domains such as AWS, Cloudflare, and Akamai are intentionally not attributed to a specific app. Pull requests that improve conservative, source-backed mappings are welcome.
+Specific rules are ordered before generic infrastructure rules. For example, an Apple/iTunes hostname delivered through Akamai preserves both Apple as the attributable service and Akamai as infrastructure. Opaque Akamai hostnames are shown as `Akamai CDN (shared infrastructure)` and are not evidence that a particular app was used.
+
+## Device identity
+
+The Reporter never groups devices by hostname. It prefers a stable NetAlertX/Pi-hole hardware identity, then falls back to the raw Pi-hole client. Multiple observed IPv4/IPv6 addresses are combined only when a shared stable identity supports the association. Distinct devices with the same hostname remain separate and receive a short stable suffix in the UI. Raw client/IP and identity confidence remain available in query details and exports.
 
 ## Changes and review signals
 
@@ -136,9 +145,24 @@ never existed or is malicious.
 
 ## Export behavior
 
-JSON, CSV, and print/PDF outputs are created by the browser from the report already
-received. The server does not persist generated reports or create export files on
-the Raspberry Pi.
+The aggregate report still supports browser-side JSON, CSV, and print/PDF. Raw query evidence uses `POST /api/exports/queries` and is serialized incrementally from read-only SQLite rows; the server does not persist files or materialize the complete export in memory. Supported scopes are one `signal_id`, all signals (deduplicated by Pi-hole query ID), or one stable `service_id`. Formats are UTF-8 CSV and JSONL/NDJSON.
+
+Every raw row includes:
+
+```text
+query_id, timestamp_local, timestamp_utc, timestamp_epoch, timezone,
+canonical_device_id, device_name, device_identity_confidence, client_key,
+client_ip, domain, service_id, service_name, company, category,
+infrastructure_provider, classification_confidence, classification_rule_id,
+classification_version, query_type_raw, query_type_label, status_raw,
+status_label, blocked, reply_type_raw, reply_type_label, reply_time, forward,
+list_id, signal_ids, signal_types, report_start_local, report_end_local,
+baseline_start_local, baseline_end_local
+```
+
+Fields unavailable in the installed Pi-hole schema are `null`/empty. Raw numeric codes are retained; labels are omitted unless the Reporter can state them safely. CSV values beginning with spreadsheet formula characters are prefixed with an apostrophe for safe opening; JSONL retains the original text. Timestamps use epoch seconds plus unambiguous UTC and `Europe/Rome` ISO-8601 forms, including DST offsets.
+
+`POST /api/queries` provides the same evidence as a bounded page (maximum 100 rows) for the UI. Both endpoints accept only server-issued snapshot tokens, known scopes/IDs, bounded text filters, known device IDs, and fixed report windows. They never accept SQL, regular expressions, or raw database predicates.
 
 ## Security and privacy
 
@@ -149,6 +173,7 @@ DNS history is sensitive. The application has no built-in user authentication in
 - Restrict it to a trusted LAN, VPN, Tailscale, or authenticated reverse proxy.
 - Never commit databases, `.env` files, logs, device exports, IP addresses, MAC addresses, tokens, or Pi-hole/NetAlertX configuration.
 - The API sends `Cache-Control: no-store` and identity-bearing report selections use a JSON POST body instead of URL query parameters.
+- Raw exports contain personal DNS history. Download and share them only as sensitive files.
 
 The repository's `.gitignore` and `.dockerignore` reject common database and secret-bearing files, but they are not a substitute for reviewing every commit.
 

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -40,14 +41,20 @@ class ReporterTestCase(unittest.TestCase):
 
     def _create_pihole_fixture(self) -> None:
         now = time.time()
-        with sqlite3.connect(self.pihole_db) as connection:
+        with closing(sqlite3.connect(self.pihole_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE queries (
+                    id INTEGER PRIMARY KEY,
                     timestamp REAL NOT NULL,
+                    type INTEGER,
                     status INTEGER NOT NULL,
                     domain TEXT NOT NULL,
-                    client TEXT NOT NULL
+                    client TEXT NOT NULL,
+                    forward TEXT,
+                    reply_type INTEGER,
+                    reply_time REAL,
+                    list_id INTEGER
                 );
                 CREATE TABLE client_by_id (
                     id INTEGER PRIMARY KEY,
@@ -93,7 +100,7 @@ class ReporterTestCase(unittest.TestCase):
             )
 
     def _create_netalertx_fixture(self) -> None:
-        with sqlite3.connect(self.netalertx_db) as connection:
+        with closing(sqlite3.connect(self.netalertx_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE Devices (
@@ -125,7 +132,7 @@ class ReporterTestCase(unittest.TestCase):
             )
 
     def _create_gravity_fixture(self) -> None:
-        with sqlite3.connect(self.gravity_db) as connection:
+        with closing(sqlite3.connect(self.gravity_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE "group" (
@@ -173,7 +180,7 @@ class ReporterTestCase(unittest.TestCase):
         self.assertEqual(phone["display_name"], "Test phone")
         self.assertEqual(phone["vendor"], "Example vendor")
         self.assertTrue(phone["netalertx_match"])
-        self.assertEqual(phone["id"], device_id("192.0.2.10"))
+        self.assertEqual(phone["id"], device_id("hardware:02:00:00:00:00:10"))
 
     def test_pihole_groups_resolve_to_recent_devices(self) -> None:
         source = PiHoleSource(
