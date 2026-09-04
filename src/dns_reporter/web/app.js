@@ -3,6 +3,12 @@ const dateFormat = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "short",
 });
+const queryDateFormat = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Rome",
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  timeZoneName: "short",
+});
 
 const elements = {
   sourceState: document.querySelector("#source-state"),
@@ -16,10 +22,18 @@ const elements = {
   loading: document.querySelector("#loading"),
   report: document.querySelector("#report"),
   detail: document.querySelector("#detail-panel"),
+  queryPanel: document.querySelector("#query-panel"),
+  queryRows: document.querySelector("#query-rows"),
+  queryCount: document.querySelector("#query-count"),
+  queryEmpty: document.querySelector("#query-empty"),
+  loadMore: document.querySelector("#load-more-queries"),
 };
 
 let currentReport = null;
 let availableGroups = [];
+let currentService = null;
+let queryState = null;
+let exportInProgress = false;
 
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
@@ -71,6 +85,7 @@ async function generateReport() {
       body: JSON.stringify(request),
     });
     renderReport(currentReport);
+    elements.queryPanel.hidden = true;
   } catch (error) {
     showError(error.message);
   } finally {
@@ -114,6 +129,8 @@ function renderSignals(changes) {
     ? `Previous ${changes.baseline_days} days`
     : "No baseline";
   const list = document.querySelector("#signals-list");
+  document.querySelector("#export-all-csv").hidden = !changes.signals.length;
+  document.querySelector("#export-all-jsonl").hidden = !changes.signals.length;
   list.replaceChildren();
   if (!changes.signals.length) {
     const empty = document.createElement("p");
@@ -129,7 +146,13 @@ function renderSignals(changes) {
     title.textContent = signal.title;
     const detail = document.createElement("p");
     detail.textContent = signal.detail;
-    item.append(title, detail);
+    const metrics = document.createElement("p");
+    metrics.className = "signal-metrics";
+    metrics.textContent = `${numberFormat.format(signal.query_count)} queries · ${numberFormat.format(signal.unique_domains)} unique domains · ${numberFormat.format(signal.device_count)} devices`;
+    const interval = document.createElement("p");
+    interval.className = "signal-interval";
+    interval.textContent = formatInterval(signal.interval);
+    item.append(title, detail, metrics, interval);
     const values = signal.domains
       ? signal.domains.map((domain) => {
           const firstSeen = domain.first_seen
@@ -148,8 +171,30 @@ function renderSignals(changes) {
       }
       item.append(tags);
     }
+    const actions = document.createElement("div");
+    actions.className = "query-actions";
+    actions.append(
+      actionButton("View queries", () => openQueryLog("signal", { signal_id: signal.signal_id }, signal.title)),
+      actionButton("Export CSV", () => exportQueries("csv", "signal", { signal_id: signal.signal_id })),
+      actionButton("Export JSONL", () => exportQueries("jsonl", "signal", { signal_id: signal.signal_id })),
+    );
+    item.append(actions);
     list.append(item);
   }
+}
+
+function actionButton(label, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function formatInterval(interval) {
+  const start = queryDateFormat.format(new Date(interval.start_epoch * 1000));
+  const end = queryDateFormat.format(new Date((interval.end_epoch - 1) * 1000));
+  return `${start} – ${end}`;
 }
 
 function renderTimeline(container, points, label) {
@@ -209,14 +254,23 @@ function renderServices(services) {
 }
 
 function showService(service, selectedRow) {
+  currentService = service;
   document.querySelectorAll(".service-row").forEach((row) => row.classList.remove("active"));
   selectedRow.classList.add("active");
   document.querySelector("#detail-title").textContent = service.service;
   document.querySelector("#detail-category").textContent = `${service.company} · ${service.category}`;
+  const infrastructureNote = document.querySelector("#infrastructure-note");
+  infrastructureNote.hidden = !service.infrastructure_provider;
+  if (service.infrastructure_provider) {
+    infrastructureNote.textContent = service.confidence === "infrastructure/ambiguous"
+      ? `${service.infrastructure_provider} is shared infrastructure; DNS alone may not identify the originating app.`
+      : `Classified as ${service.service_name}; delivered through ${service.infrastructure_provider} infrastructure.`;
+  }
   const metrics = document.querySelector("#detail-metrics");
   metrics.replaceChildren();
   for (const value of [
     `${numberFormat.format(service.queries)} queries`,
+    `${numberFormat.format(service.unique_domains)} unique domains`,
     `${service.share}% of total`,
     `${numberFormat.format(service.blocked)} blocked`,
     `${service.confidence} confidence`,
@@ -243,6 +297,9 @@ function showService(service, selectedRow) {
     }
   }
   const domains = document.querySelector("#domain-list");
+  document.querySelector("#domain-list-title").textContent = service.domains_truncated
+    ? `Top ${service.domains.length} of ${numberFormat.format(service.unique_domains)} domains`
+    : `All ${numberFormat.format(service.unique_domains)} domains`;
   domains.replaceChildren();
   for (const domain of service.domains) {
     const row = document.createElement("div");
@@ -256,6 +313,128 @@ function showService(service, selectedRow) {
   }
   elements.detail.hidden = false;
   elements.detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function openQueryLog(scope, selector, title) {
+  queryState = { scope, selector, title, offset: 0 };
+  document.querySelector("#query-title").textContent = title;
+  const deviceSelect = document.querySelector("#query-device-filter");
+  deviceSelect.replaceChildren(new Option("All devices", ""));
+  for (const device of currentReport.scope.devices) {
+    deviceSelect.append(new Option(device.display_name, device.id));
+  }
+  document.querySelector("#query-domain-filter").value = "";
+  document.querySelector("#query-sort").value = "desc";
+  elements.queryRows.replaceChildren();
+  elements.queryPanel.hidden = false;
+  await loadQueryPage(true);
+  elements.queryPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function loadQueryPage(reset = false) {
+  if (!queryState || elements.loadMore.disabled) return;
+  if (reset) {
+    queryState.offset = 0;
+    elements.queryRows.replaceChildren();
+  }
+  elements.loadMore.disabled = true;
+  elements.queryCount.textContent = "Loading DNS evidence…";
+  try {
+    const payload = await requestJson("/api/queries", {
+      method: "POST",
+      body: JSON.stringify({
+        snapshot_token: currentReport.snapshot_token,
+        scope: queryState.scope,
+        selector: queryState.selector,
+        offset: queryState.offset,
+        limit: 50,
+        sort: document.querySelector("#query-sort").value,
+        domain_filter: document.querySelector("#query-domain-filter").value,
+        device_id: document.querySelector("#query-device-filter").value,
+      }),
+    });
+    renderQueryRows(payload.rows);
+    queryState.offset += payload.rows.length;
+    elements.queryCount.textContent = `${numberFormat.format(payload.total)} matching DNS queries · showing ${numberFormat.format(queryState.offset)}`;
+    elements.queryEmpty.hidden = payload.total !== 0;
+    elements.loadMore.hidden = !payload.has_more;
+  } catch (error) {
+    showError(error.message);
+    elements.queryCount.textContent = "Unable to load query evidence.";
+  } finally {
+    elements.loadMore.disabled = false;
+  }
+}
+
+function renderQueryRows(rows) {
+  for (const event of rows) {
+    const row = document.createElement("tr");
+    const time = document.createElement("td");
+    time.dataset.label = "Time";
+    time.textContent = queryDateFormat.format(new Date(event.timestamp_epoch * 1000));
+    const device = document.createElement("td");
+    device.dataset.label = "Device";
+    device.textContent = event.device_name;
+    device.title = `${event.client_key} · ${event.device_identity_confidence} identity confidence`;
+    const domain = document.createElement("td");
+    domain.dataset.label = "Domain";
+    const domainCode = document.createElement("code");
+    domainCode.textContent = event.domain;
+    domain.append(domainCode);
+    const service = document.createElement("td");
+    service.dataset.label = "Service / infrastructure";
+    service.textContent = event.infrastructure_provider
+      ? `${event.service_name} · ${event.infrastructure_provider}`
+      : event.service_name;
+    const status = document.createElement("td");
+    status.dataset.label = "Status";
+    const badge = document.createElement("span");
+    badge.className = `status-badge ${event.blocked ? "blocked" : "allowed"}`;
+    badge.textContent = event.blocked ? `Blocked (${event.status_raw})` : `Allowed (${event.status_raw})`;
+    status.append(badge);
+    row.append(time, device, domain, service, status);
+    elements.queryRows.append(row);
+  }
+}
+
+async function exportQueries(
+  format, scope = queryState?.scope, selector = queryState?.selector, useFilters = false,
+) {
+  if (!currentReport || !scope || !selector || exportInProgress) return;
+  exportInProgress = true;
+  hideError();
+  try {
+    const response = await fetch("/api/exports/queries", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        snapshot_token: currentReport.snapshot_token,
+        format, scope, selector,
+        domain_filter: useFilters ? document.querySelector("#query-domain-filter").value : "",
+        device_id: useFilters ? document.querySelector("#query-device-filter").value : "",
+      }),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || `Export failed (${response.status})`);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `homeshield-queries.${format}`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    exportInProgress = false;
+  }
 }
 
 function showError(message) {
@@ -356,6 +535,22 @@ function updateControls() {
 
 elements.generateButton.addEventListener("click", generateReport);
 document.querySelector("#close-detail").addEventListener("click", () => { elements.detail.hidden = true; });
+document.querySelector("#close-query-panel").addEventListener("click", () => { elements.queryPanel.hidden = true; });
+document.querySelector("#view-service-queries").addEventListener("click", () => {
+  if (currentService) openQueryLog("service", { service_id: currentService.service_id }, currentService.service_name);
+});
+document.querySelector("#export-service-csv").addEventListener("click", () => {
+  if (currentService) exportQueries("csv", "service", { service_id: currentService.service_id });
+});
+document.querySelector("#export-service-jsonl").addEventListener("click", () => {
+  if (currentService) exportQueries("jsonl", "service", { service_id: currentService.service_id });
+});
+document.querySelector("#export-all-csv").addEventListener("click", () => exportQueries("csv", "all_signals", {}));
+document.querySelector("#export-all-jsonl").addEventListener("click", () => exportQueries("jsonl", "all_signals", {}));
+document.querySelector("#apply-query-filters").addEventListener("click", () => loadQueryPage(true));
+elements.loadMore.addEventListener("click", () => loadQueryPage(false));
+document.querySelector("#export-query-csv").addEventListener("click", () => exportQueries("csv", undefined, undefined, true));
+document.querySelector("#export-query-jsonl").addEventListener("click", () => exportQueries("jsonl", undefined, undefined, true));
 document.querySelector("#download-json").addEventListener("click", () => {
   if (currentReport) downloadBlob(JSON.stringify(currentReport, null, 2), "application/json", "json");
 });

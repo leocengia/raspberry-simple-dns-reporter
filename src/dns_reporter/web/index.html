@@ -119,7 +119,11 @@
               <p class="eyebrow">Changes &amp; Red Flags</p>
               <h3>Signals to review</h3>
             </div>
-            <span id="baseline-label" class="chip"></span>
+            <div class="panel-actions">
+              <span id="baseline-label" class="chip"></span>
+              <button type="button" id="export-all-csv" hidden>Export all CSV</button>
+              <button type="button" id="export-all-jsonl" hidden>Export all JSONL</button>
+            </div>
           </div>
           <div id="signals-list" class="signals-list"></div>
         </section>
@@ -157,12 +161,51 @@
             <button type="button" class="close-button" id="close-detail">Close</button>
           </div>
           <div class="detail-metrics" id="detail-metrics"></div>
+          <p id="infrastructure-note" class="caveat" hidden>
+            Shared infrastructure classification: DNS alone may not identify the originating app.
+          </p>
+          <div class="query-actions">
+            <button type="button" id="view-service-queries">View query log</button>
+            <button type="button" id="export-service-csv">Export CSV</button>
+            <button type="button" id="export-service-jsonl">Export JSONL</button>
+          </div>
           <div id="service-chart" class="timeline-chart compact" role="img"></div>
           <div id="device-comparison" class="device-comparison" hidden>
             <h4>Device comparison</h4>
             <div id="device-comparison-list"></div>
           </div>
+          <h4 id="domain-list-title" class="section-label">Top domains</h4>
           <div class="domain-list" id="domain-list"></div>
+        </section>
+
+        <section class="panel query-panel" id="query-panel" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Verifiable evidence</p>
+              <h3 id="query-title">Query log</h3>
+              <p id="query-count" class="muted"></p>
+            </div>
+            <button type="button" class="close-button" id="close-query-panel">Close</button>
+          </div>
+          <div class="query-toolbar">
+            <label>Domain contains<input id="query-domain-filter" type="search" maxlength="200" placeholder="example.com"></label>
+            <label>Device<select id="query-device-filter"><option value="">All devices</option></select></label>
+            <label>Time order<select id="query-sort"><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label>
+            <button type="button" id="apply-query-filters">Apply</button>
+          </div>
+          <div class="query-actions">
+            <button type="button" id="export-query-csv">Export CSV</button>
+            <button type="button" id="export-query-jsonl">Export JSONL</button>
+          </div>
+          <div class="query-table-wrap">
+            <table class="query-table">
+              <thead><tr><th>Time (Europe/Rome)</th><th>Device</th><th>Domain</th><th>Service / infrastructure</th><th>Status</th></tr></thead>
+              <tbody id="query-rows"></tbody>
+            </table>
+          </div>
+          <p id="query-empty" class="empty-state" hidden>No DNS queries match this selection.</p>
+          <button type="button" id="load-more-queries" class="load-more" hidden>Load more</button>
+          <p class="privacy-note">Exports contain DNS name-resolution events, not full URLs, contents, searches, usage duration, or transferred data.</p>
         </section>
       </div>
     </main>
