@@ -45,17 +45,29 @@
             <small id="group-hint" class="muted"></small>
           </label>
         </div>
-        <label class="time-control">
-          <span>Time range</span>
-          <select id="hours-select">
-            <option value="3">Last 3h</option>
-            <option value="6">Last 6h</option>
-            <option value="12">Last 12h</option>
-            <option value="24" selected>Last 24h</option>
-            <option value="48">Last 48h</option>
-            <option value="168">Last 7 days</option>
-          </select>
-        </label>
+        <div class="time-control">
+          <span class="control-label">Time range</span>
+          <fieldset class="range-control">
+            <legend>Time range type</legend>
+            <label><input type="radio" name="period-mode" value="rolling" checked> Recent</label>
+            <label><input type="radio" name="period-mode" value="calendar"> Specific day</label>
+          </fieldset>
+          <label id="rolling-control">
+            <span class="visually-hidden">Recent time range</span>
+            <select id="hours-select">
+              <option value="3">Last 3h</option>
+              <option value="6">Last 6h</option>
+              <option value="12">Last 12h</option>
+              <option value="24" selected>Last 24h</option>
+              <option value="48">Last 48h</option>
+              <option value="168">Last 7 days</option>
+            </select>
+          </label>
+          <label id="date-control" hidden>
+            <span class="visually-hidden">Report date</span>
+            <input id="report-date" type="date">
+          </label>
+        </div>
         <button id="generate-button" type="button" disabled>Generate report</button>
       </section>
 

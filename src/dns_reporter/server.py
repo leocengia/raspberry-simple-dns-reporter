@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import math
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -13,7 +13,7 @@ from typing import Callable, Iterable
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from .classifier import DomainClassifier
-from .database import SourceUnavailable
+from .database import SourceUnavailable, connect_readonly
 from .evidence import EvidenceSpec
 from .events import ROME, QueryEvent, normalize_event
 from .exports import safe_fragment, stream_csv, stream_jsonl
@@ -84,13 +84,9 @@ class Application:
                 )
             if method == "POST" and path == "/api/report":
                 payload = self._read_json(environ)
-                hours = int(payload.get("hours", 24))
-                if hours not in ALLOWED_HOURS:
-                    return self._json(
-                        start_response,
-                        HTTPStatus.BAD_REQUEST,
-                        {"error": "unsupported time range"},
-                    )
+                generated_at = time.time()
+                window = self._report_window(payload, generated_at)
+                hours = window["hours"]
                 group = None
                 group_identifier = str(payload.get("group_id", ""))
                 if group_identifier:
@@ -121,7 +117,6 @@ class Application:
                         HTTPStatus.NOT_FOUND,
                         {"error": "one or more devices were not found"},
                     )
-                generated_at = time.time()
                 addresses = [
                     str(address)
                     for device in devices
@@ -129,13 +124,13 @@ class Application:
                 ]
                 rows = self.pihole.query_range(
                     addresses,
-                    generated_at - hours * 3600,
-                    generated_at,
+                    float(window["start"]),
+                    float(window["end"]),
                 )
-                historical = self.pihole.historical_context(
+                historical = self.pihole.historical_context_range(
                     addresses,
-                    hours,
-                    generated_at,
+                    float(window["baseline_start"]),
+                    float(window["baseline_end"]),
                 )
                 report = build_report(
                     rows,
@@ -145,6 +140,12 @@ class Application:
                     group=group,
                     generated_at=generated_at,
                     historical=historical,
+                    window_start=float(window["start"]),
+                    window_end=float(window["end"]),
+                    range_kind=str(window["range_kind"]),
+                    report_date=window["report_date"],
+                    complete_day=window["complete_day"],
+                    period_label=window["period_label"],
                 )
                 self._attach_snapshot(report, devices, addresses)
                 return self._json(start_response, HTTPStatus.OK, report)
@@ -177,12 +178,12 @@ class Application:
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": str(exc)},
             )
-        except sqlite3.Error:
-            LOGGER.warning("data source temporarily busy")
+        except sqlite3.Error as exc:
+            LOGGER.warning("data source query failed: %s", exc)
             return self._json(
                 start_response,
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"error": "Data source temporarily busy; try again shortly"},
+                {"error": "Data source could not complete the request; try again shortly"},
             )
         except Exception:
             LOGGER.exception("request failed")
@@ -194,11 +195,78 @@ class Application:
 
     def _health(self) -> dict[str, object]:
         sources = {
-            "pihole": os.access(self.settings.pihole_db, os.R_OK),
-            "gravity": os.access(self.settings.gravity_db, os.R_OK),
-            "netalertx": os.access(self.settings.netalertx_db, os.R_OK),
+            "pihole": self._source_readable(self.settings.pihole_db),
+            "gravity": self._source_readable(self.settings.gravity_db),
+            "netalertx": self._source_readable(self.settings.netalertx_db),
         }
         return {"status": "ok" if all(sources.values()) else "degraded", "sources": sources}
+
+    @staticmethod
+    def _source_readable(path: Path) -> bool:
+        try:
+            with connect_readonly(path) as connection:
+                connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+            return True
+        except (SourceUnavailable, sqlite3.Error):
+            return False
+
+    @staticmethod
+    def _report_window(
+        payload: dict[str, object], generated_at: float
+    ) -> dict[str, object]:
+        requested_date = str(payload.get("report_date", "")).strip()
+        if requested_date:
+            if "hours" in payload:
+                raise ValueError("choose a rolling range or a calendar day")
+            try:
+                report_day = datetime.strptime(requested_date, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ValueError("invalid report date") from exc
+            now_local = datetime.fromtimestamp(generated_at, ROME)
+            if report_day > now_local.date():
+                raise ValueError("future report date")
+            start_local = datetime.combine(report_day, datetime.min.time(), tzinfo=ROME)
+            next_local = datetime.combine(
+                report_day + timedelta(days=1), datetime.min.time(), tzinfo=ROME
+            )
+            baseline_local = datetime.combine(
+                report_day - timedelta(days=7), datetime.min.time(), tzinfo=ROME
+            )
+            start = start_local.timestamp()
+            next_start = next_local.timestamp()
+            complete_day = report_day < now_local.date()
+            end = next_start if complete_day else generated_at
+            if not start < end <= next_start:
+                raise ValueError("invalid report date range")
+            duration = (end - start) / 3600
+            hours: int | float = int(duration) if duration.is_integer() else round(duration, 6)
+            return {
+                "start": start,
+                "end": end,
+                "hours": hours,
+                "range_kind": "calendar_day",
+                "report_date": requested_date,
+                "complete_day": complete_day,
+                "period_label": requested_date,
+                "baseline_start": baseline_local.timestamp(),
+                "baseline_end": start,
+            }
+
+        hours = int(payload.get("hours", 24))
+        if hours not in ALLOWED_HOURS:
+            raise ValueError("unsupported time range")
+        start = generated_at - hours * 3600
+        return {
+            "start": start,
+            "end": generated_at,
+            "hours": hours,
+            "range_kind": "rolling",
+            "report_date": None,
+            "complete_day": None,
+            "period_label": None,
+            "baseline_start": start - 7 * 86400,
+            "baseline_end": start,
+        }
 
     @staticmethod
     def _read_json(
@@ -264,10 +332,39 @@ class Application:
             raise InvalidSnapshot("invalid report snapshot")
         if context.get("classification_version") != self.classifier.version:
             raise InvalidSnapshot("classification changed; generate a new report")
-        hours = int(context.get("hours", 0))
         start = float(context.get("report_start_epoch", 0))
         end = float(context.get("report_end_epoch", 0))
-        if hours not in ALLOWED_HOURS or abs((end - start) - hours * 3600) > 1:
+        if not all(math.isfinite(value) for value in (start, end)) or not start < end:
+            raise InvalidSnapshot("invalid report snapshot")
+        range_kind = str(context.get("range_kind", "rolling"))
+        if range_kind == "rolling":
+            hours = int(context.get("hours", 0))
+            if hours not in ALLOWED_HOURS or abs((end - start) - hours * 3600) > 1:
+                raise InvalidSnapshot("invalid report snapshot")
+        elif range_kind == "calendar_day":
+            try:
+                report_day = datetime.strptime(
+                    str(context.get("report_date", "")), "%Y-%m-%d"
+                ).date()
+                expected_start = datetime.combine(
+                    report_day, datetime.min.time(), tzinfo=ROME
+                ).timestamp()
+                next_start = datetime.combine(
+                    report_day + timedelta(days=1), datetime.min.time(), tzinfo=ROME
+                ).timestamp()
+                generated = float(context["generated_at_epoch"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidSnapshot("invalid report snapshot") from exc
+            if (
+                not math.isfinite(generated)
+                or abs(start - expected_start) > 1
+                or not start < end <= next_start
+            ):
+                raise InvalidSnapshot("invalid report snapshot")
+            expected_end = next_start if context.get("complete_day") is True else generated
+            if abs(end - expected_end) > 1:
+                raise InvalidSnapshot("invalid report snapshot")
+        else:
             raise InvalidSnapshot("invalid report snapshot")
         return snapshot
 

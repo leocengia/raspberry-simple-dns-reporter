@@ -10,7 +10,8 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 - Multi-device selection and aggregated reports
 - Pi-hole group selection (exact IP, subnet, and MAC selectors)
 - NetAlertX name, vendor, type, and presence enrichment
-- 3h, 6h, 12h, 24h, 48h, and 7-day reports
+- 3h, 6h, 12h, 24h, 48h, and 7-day rolling reports
+- Reports for a specific `Europe/Rome` calendar day, including correct 23/25-hour DST days and the current day so far
 - Total queries, blocked percentage, and unique domains
 - Domain-to-service classification with confidence labels
 - DNS activity timeline
@@ -37,7 +38,7 @@ Browser
   <- HTML, JSON, CSS and JavaScript
 ```
 
-Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
+Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; a selected calendar day runs from local midnight to the next local midnight (or to the generation time when selecting today). Subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
 
 ## Requirements
 

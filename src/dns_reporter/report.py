@@ -15,19 +15,27 @@ from .events import APP_TIMEZONE, ROME, iso_timestamp, normalize_event
 def build_report(
     rows: Iterable[dict[str, object]],
     devices: dict[str, object] | list[dict[str, object]],
-    hours: int,
+    hours: int | float,
     classifier: DomainClassifier,
     *,
     group: dict[str, object] | None = None,
     generated_at: float | None = None,
     historical: dict[str, object] | None = None,
+    window_start: float | None = None,
+    window_end: float | None = None,
+    range_kind: str = "rolling",
+    report_date: str | None = None,
+    complete_day: bool | None = None,
+    period_label: str | None = None,
 ) -> dict[str, object]:
     selected_devices = [devices] if isinstance(devices, dict) else list(devices)
     if not selected_devices:
         raise ValueError("at least one device is required")
-    end = float(generated_at or time.time())
-    start = end - hours * 3600
-    bucket_seconds = 1800 if hours <= 12 else 3600 if hours <= 48 else 21600
+    generated = float(generated_at or time.time())
+    end = float(window_end if window_end is not None else generated)
+    start = float(window_start if window_start is not None else end - hours * 3600)
+    duration_hours = (end - start) / 3600
+    bucket_seconds = 1800 if duration_hours <= 12 else 3600 if duration_hours <= 48 else 21600
     devices_by_address = {
         str(address): device
         for device in selected_devices
@@ -139,6 +147,10 @@ def build_report(
         "device_ids": [str(device["id"]) for device in selected_devices],
         "classification_version": classifier.version,
         "hours": hours,
+        "range_kind": range_kind,
+        "report_date": report_date,
+        "complete_day": complete_day,
+        "generated_at_epoch": generated,
     }
     changes = _detect_changes(
         total, domain_counts, domain_first_seen, domain_devices, hourly_counts,
@@ -156,8 +168,12 @@ def build_report(
         "new_services": changes["new_service_count"],
     }
     return {
-        "generated_at": iso_timestamp(end, ROME),
+        "generated_at": iso_timestamp(generated, ROME),
         "hours": hours,
+        "range_kind": range_kind,
+        "report_date": report_date,
+        "complete_day": complete_day,
+        "period_label": period_label,
         "timezone": APP_TIMEZONE,
         "report_context": context,
         "scope": scope,
@@ -166,7 +182,10 @@ def build_report(
         "timeline": _timeline(overall_buckets, timeline_buckets),
         "services": service_rows,
         "changes": changes,
-        "summary": _summary(scope, overview, service_rows, hours, changes),
+        "summary": _summary(
+            scope, overview, service_rows, hours, changes,
+            range_kind=range_kind, period_label=period_label,
+        ),
         "caveat": (
             "DNS activity shows name-resolution requests, not app usage duration, "
             "content, messages, searches, or transferred data."
@@ -191,8 +210,10 @@ def _scope(public_devices: list[dict[str, object]], group: dict[str, object] | N
 
 def _bucket_range(start: float, end: float, step: int) -> list[int]:
     first = int(start // step) * step
-    last = int(end // step) * step
-    return list(range(first, last + step, step))
+    # `end` is exclusive throughout the query API.  Do not add an empty bucket
+    # whose start is exactly the end of an aligned report window.
+    stop = int((end + step - 1) // step) * step
+    return list(range(first, stop, step))
 
 
 def _timeline(counts: Counter[int], buckets: list[int]) -> list[dict[str, object]]:
@@ -375,16 +396,18 @@ def _detect_changes(
 
 def _summary(
     scope: dict[str, object], overview: dict[str, object], services: list[dict[str, object]],
-    hours: int, changes: dict[str, object],
+    hours: int | float, changes: dict[str, object], *, range_kind: str = "rolling",
+    period_label: str | None = None,
 ) -> str:
     name = str(scope.get("display_name") or "The selected devices")
     total = int(overview["total_queries"])
     period = "7 days" if hours == 168 else f"{hours} hours"
+    prefix = f"On {period_label}" if range_kind == "calendar_day" else f"In the last {period}"
     if not total:
-        return f"No DNS activity was recorded for {name} in the last {period}."
+        return f"No DNS activity was recorded for {name} {prefix.lower()}."
     leading = [service for service in services if service["confidence"] != "unknown"][:3]
     service_text = ", ".join(str(service["service"]) for service in leading) if leading else "unclassified domains"
-    base = (f"In the last {period}, {name} generated {total:,} DNS queries. "
+    base = (f"{prefix}, {name} generated {total:,} DNS queries. "
             f"{overview['blocked_percentage']}% were blocked. The main identifiable services were {service_text}.")
     if changes["baseline_days"]:
         count = int(overview["new_domains"])

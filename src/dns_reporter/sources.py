@@ -319,8 +319,24 @@ class PiHoleSource:
             raise ValueError("between 1 and 128 clients are required")
         current_start = end_time - hours * 3600
         baseline_start = current_start - baseline_days * 86400
+        return self.historical_context_range(
+            unique_clients, baseline_start, current_start, baseline_days
+        )
+
+    def historical_context_range(
+        self,
+        clients: list[str],
+        baseline_start: float,
+        baseline_end: float,
+        baseline_days: int = 7,
+    ) -> dict[str, object]:
+        unique_clients = list(dict.fromkeys(clients))
+        if not unique_clients or len(unique_clients) > 128:
+            raise ValueError("between 1 and 128 clients are required")
+        if not baseline_start < baseline_end:
+            raise ValueError("invalid baseline range")
         placeholders = ",".join("?" for _ in unique_clients)
-        parameters = (baseline_start, current_start, *unique_clients)
+        parameters = (baseline_start, baseline_end, *unique_clients)
         with connect_readonly(self.database_path) as connection:
             domain_rows = connection.execute(
                 f"""
@@ -347,7 +363,7 @@ class PiHoleSource:
         return {
             "baseline_days": baseline_days,
             "start": baseline_start,
-            "end": current_start,
+            "end": baseline_end,
             "domain_counts": {
                 str(row["domain"] or "").lower().rstrip("."): int(row["query_count"])
                 for row in domain_rows

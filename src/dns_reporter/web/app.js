@@ -17,6 +17,9 @@ const elements = {
   groupControl: document.querySelector("#group-control"),
   groupSelect: document.querySelector("#group-select"),
   groupHint: document.querySelector("#group-hint"),
+  rollingControl: document.querySelector("#rolling-control"),
+  dateControl: document.querySelector("#date-control"),
+  reportDate: document.querySelector("#report-date"),
   generateButton: document.querySelector("#generate-button"),
   error: document.querySelector("#error-banner"),
   loading: document.querySelector("#loading"),
@@ -42,26 +45,58 @@ async function requestJson(url, options = {}) {
     ...options,
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return payload;
+}
+
+function setSourceState(kind, message) {
+  elements.sourceState.classList.remove("ok", "degraded");
+  if (kind) elements.sourceState.classList.add(kind);
+  elements.sourceState.lastChild.textContent = ` ${message}`;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function todayInRome() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
 }
 
 async function initialize() {
   try {
     const health = await requestJson("/api/health");
     const healthy = health.status === "ok";
-    elements.sourceState.classList.add(healthy ? "ok" : "degraded");
-    elements.sourceState.lastChild.textContent = healthy ? " Sources ready" : " Source degraded";
+    setSourceState(healthy ? "ok" : "degraded", healthy ? "Sources ready" : "Source degraded");
 
-    const { devices, groups } = await requestJson("/api/devices");
+    let inventory;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        inventory = await requestJson("/api/devices");
+        break;
+      } catch (error) {
+        if (error.status !== 503 || attempt === 2) throw error;
+        setSourceState("degraded", "Source busy · retrying");
+        await sleep(500 * (2 ** attempt));
+      }
+    }
+    const { devices, groups } = inventory;
     if (!devices.length) throw new Error("No devices found in the recent Pi-hole history.");
     renderDeviceOptions(devices);
     renderGroupOptions(groups || []);
+    setSourceState("ok", "Sources ready");
     updateControls();
   } catch (error) {
     showError(error.message);
-    elements.sourceState.classList.add("degraded");
-    elements.sourceState.lastChild.textContent = " Sources unavailable";
+    setSourceState("degraded", "Sources unavailable");
   }
 }
 
@@ -71,9 +106,11 @@ async function generateReport() {
   elements.generateButton.disabled = true;
   elements.detail.hidden = true;
   try {
-    const hours = Number(document.querySelector("#hours-select").value);
+    const periodMode = document.querySelector('input[name="period-mode"]:checked').value;
     const mode = document.querySelector('input[name="scope"]:checked').value;
-    const request = { hours };
+    const request = periodMode === "calendar"
+      ? { report_date: elements.reportDate.value }
+      : { hours: Number(document.querySelector("#hours-select").value) };
     if (mode === "group") {
       request.group_id = elements.groupSelect.value;
     } else {
@@ -90,7 +127,7 @@ async function generateReport() {
     showError(error.message);
   } finally {
     elements.loading.hidden = true;
-    elements.generateButton.disabled = false;
+    updateControls();
   }
 }
 
@@ -115,9 +152,9 @@ function renderReport(report) {
   document.querySelector("#signal-count").textContent = numberFormat.format(report.changes.signals.length);
   document.querySelector("#summary").textContent = report.summary;
   document.querySelector("#caveat").textContent = report.caveat;
-  document.querySelector("#timeline-range").textContent = report.hours === 168
-    ? "Last 7 days"
-    : `Last ${report.hours}h`;
+  document.querySelector("#timeline-range").textContent = report.range_kind === "calendar_day"
+    ? `${report.report_date}${report.complete_day ? "" : " · so far"}`
+    : report.hours === 168 ? "Last 7 days" : `Last ${report.hours}h`;
   renderSignals(report.changes);
   renderTimeline(document.querySelector("#activity-chart"), report.timeline, "DNS queries");
   renderServices(report.services);
@@ -449,7 +486,7 @@ function safeFilename(extension) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "") || "report";
-  const date = currentReport.generated_at.slice(0, 10);
+  const date = currentReport.report_date || currentReport.generated_at.slice(0, 10);
   return `dns-report-${name}-${date}.${extension}`;
 }
 
@@ -523,14 +560,19 @@ function renderGroupOptions(groups) {
 
 function updateControls() {
   const mode = document.querySelector('input[name="scope"]:checked').value;
+  const periodMode = document.querySelector('input[name="period-mode"]:checked').value;
   const group = availableGroups.find((item) => item.id === elements.groupSelect.value);
   const selectedDevices = document.querySelectorAll('.device-option input:checked').length;
+  const validPeriod = periodMode === "rolling" || Boolean(elements.reportDate.value);
   elements.devicesControl.hidden = mode !== "devices";
   elements.groupControl.hidden = mode !== "group";
+  elements.rollingControl.hidden = periodMode !== "rolling";
+  elements.dateControl.hidden = periodMode !== "calendar";
   elements.groupHint.textContent = group
     ? `${group.device_count} recent device${group.device_count === 1 ? "" : "s"} matched`
     : "No usable Pi-hole groups found";
-  elements.generateButton.disabled = mode === "devices" ? selectedDevices === 0 : !group;
+  const validScope = mode === "devices" ? selectedDevices > 0 : Boolean(group);
+  elements.generateButton.disabled = !validScope || !validPeriod;
 }
 
 elements.generateButton.addEventListener("click", generateReport);
@@ -557,6 +599,8 @@ document.querySelector("#download-json").addEventListener("click", () => {
 document.querySelector("#download-csv").addEventListener("click", downloadCsv);
 document.querySelector("#print-report").addEventListener("click", () => window.print());
 document.querySelectorAll('input[name="scope"]').forEach((input) => input.addEventListener("change", updateControls));
+document.querySelectorAll('input[name="period-mode"]').forEach((input) => input.addEventListener("change", updateControls));
+elements.reportDate.addEventListener("change", updateControls);
 elements.groupSelect.addEventListener("change", updateControls);
 document.querySelector("#select-all").addEventListener("click", () => {
   document.querySelectorAll('.device-option input').forEach((input) => { input.checked = true; });
@@ -566,4 +610,6 @@ document.querySelector("#clear-selection").addEventListener("click", () => {
   document.querySelectorAll('.device-option input').forEach((input) => { input.checked = false; });
   updateControls();
 });
+elements.reportDate.max = todayInRome();
+elements.reportDate.value = elements.reportDate.max;
 initialize();

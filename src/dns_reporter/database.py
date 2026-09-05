@@ -33,6 +33,10 @@ def connect_readonly(path: Path) -> Iterator[sqlite3.Connection]:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 1000")
+        # The container intentionally has a very small read-only filesystem and
+        # /tmp.  Pi-hole inventory queries need a temporary B-tree; keeping it in
+        # process memory avoids a misleading SQLITE_FULL when /tmp fills up.
+        connection.execute("PRAGMA temp_store = MEMORY")
     except sqlite3.Error as exc:
         raise SourceUnavailable(
             f"Unable to open data source: {resolved.name}"

@@ -138,17 +138,31 @@ h3 { margin-bottom: 0; font-size: 1.15rem; }
 .device-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .84rem; }
 #group-control small { display: block; margin-top: 7px; font-size: .75rem; }
 
-select, .range-control, #generate-button {
+select, input[type="date"], .range-control, #generate-button {
   min-height: 45px;
   border: 1px solid var(--border);
   border-radius: 11px;
 }
 
-select {
+select, input[type="date"] {
   width: 100%;
-  padding: 0 38px 0 13px;
+  padding: 0 13px;
   color: var(--text);
   background: var(--surface-raised);
+}
+
+select { padding-right: 38px; }
+.time-control { min-width: 265px; }
+.time-control .range-control { margin-bottom: 8px; }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .range-control {

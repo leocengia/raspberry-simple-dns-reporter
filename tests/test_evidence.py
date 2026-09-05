@@ -101,6 +101,45 @@ class EvidenceTestCase(unittest.TestCase):
         self.assertEqual(iso_timestamp(summer_side, ROME), "2026-10-25T02:30:00+02:00")
         self.assertEqual(iso_timestamp(winter_side, ROME), "2026-10-25T02:30:00+01:00")
 
+    def test_calendar_day_reports_follow_rome_dst_boundaries(self) -> None:
+        app = Application(self.settings)
+        device = self._call_json(app, "GET", "/api/devices")["devices"][0]
+        for report_date, expected_hours in (("2025-03-30", 23), ("2025-10-26", 25)):
+            report = self._call_json(
+                app, "POST", "/api/report",
+                {"report_date": report_date, "device_ids": [device["id"]]},
+            )
+            context = report["report_context"]
+            self.assertEqual(report["range_kind"], "calendar_day")
+            self.assertEqual(report["report_date"], report_date)
+            self.assertTrue(report["complete_day"])
+            self.assertEqual(
+                context["report_end_epoch"] - context["report_start_epoch"],
+                expected_hours * 3600,
+            )
+            self.assertEqual(app._validate_snapshot(report["snapshot_token"])["context"], context)
+
+    def test_calendar_day_rejects_future_and_ambiguous_ranges(self) -> None:
+        app = Application(self.settings)
+        device = self._call_json(app, "GET", "/api/devices")["devices"][0]
+        status, _, _ = self._call(
+            app, "POST", "/api/report",
+            {"report_date": "2999-01-01", "device_ids": [device["id"]]},
+        )
+        self.assertEqual(status, "400 Bad Request")
+        status, _, _ = self._call(
+            app, "POST", "/api/report",
+            {"report_date": "2025-03-30", "hours": 24, "device_ids": [device["id"]]},
+        )
+        self.assertEqual(status, "400 Bad Request")
+
+    def test_current_calendar_day_ends_at_generation_time(self) -> None:
+        generated = datetime(2026, 3, 30, 12, 15, tzinfo=ROME).timestamp()
+        window = Application._report_window({"report_date": "2026-03-30"}, generated)
+        self.assertFalse(window["complete_day"])
+        self.assertEqual(window["end"], generated)
+        self.assertEqual(window["baseline_end"], window["start"])
+
     def test_device_identity_merges_shared_mac_and_disambiguates_names(self) -> None:
         source = PiHoleSource(self.pihole_db, NetAlertXSource(self.netalertx_db))
         devices = source.list_devices(lookback_hours=24)
