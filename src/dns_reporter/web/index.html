@@ -84,6 +84,7 @@
           <div class="report-actions">
             <p id="generated-at" class="muted generated-at"></p>
             <div>
+              <button type="button" id="download-llm">LLM report (.md)</button>
               <button type="button" id="download-json">JSON</button>
               <button type="button" id="download-csv">CSV</button>
               <button type="button" id="print-report">Print / PDF</button>
@@ -133,6 +134,7 @@
             </div>
             <div class="panel-actions">
               <span id="baseline-label" class="chip"></span>
+              <button type="button" id="export-all-md" hidden>Export all LLM .md</button>
               <button type="button" id="export-all-csv" hidden>Export all CSV</button>
               <button type="button" id="export-all-jsonl" hidden>Export all JSONL</button>
             </div>
@@ -178,6 +180,7 @@
           </p>
           <div class="query-actions">
             <button type="button" id="view-service-queries">View query log</button>
+            <button type="button" id="export-service-md">Export LLM .md</button>
             <button type="button" id="export-service-csv">Export CSV</button>
             <button type="button" id="export-service-jsonl">Export JSONL</button>
           </div>
@@ -206,6 +209,7 @@
             <button type="button" id="apply-query-filters">Apply</button>
           </div>
           <div class="query-actions">
+            <button type="button" id="export-query-md">Export LLM .md</button>
             <button type="button" id="export-query-csv">Export CSV</button>
             <button type="button" id="export-query-jsonl">Export JSONL</button>
           </div>

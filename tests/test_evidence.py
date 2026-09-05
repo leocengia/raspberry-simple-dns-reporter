@@ -145,6 +145,7 @@ class EvidenceTestCase(unittest.TestCase):
         devices = source.list_devices(lookback_hours=24)
         self.assertEqual(len(devices), 2)
         merged = next(device for device in devices if len(device["addresses"]) == 2)
+        self.assertEqual(merged["display_name"], "Leonardo phone")
         self.assertEqual(merged["query_count"], 2)
         self.assertEqual(merged["identity_confidence"], "high")
         self.assertEqual(len({device["display_name"] for device in devices}), 2)
@@ -193,6 +194,45 @@ class EvidenceTestCase(unittest.TestCase):
         self.assertEqual(csv_rows[0]["service_id"], "youtube")
         self.assertTrue(csv_rows[0]["timestamp_local"])
         self.assertTrue(csv_rows[0]["timestamp_utc"])
+
+    def test_llm_markdown_report_is_self_describing_and_time_bucketed(self) -> None:
+        bucket = self.now - (self.now % 300)
+        with closing(sqlite3.connect(self.pihole_db)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO queries(timestamp,type,status,domain,client) VALUES (?,?,?,?,?)",
+                [
+                    (bucket + 10, 1, 2, "llm-bucket.example", "192.0.2.10"),
+                    (bucket + 20, 1, 1, "llm-bucket.example", "192.0.2.10"),
+                ],
+            )
+        app = Application(self.settings)
+        devices = self._call_json(app, "GET", "/api/devices")["devices"]
+        merged = next(device for device in devices if len(device["addresses"]) == 2)
+        report = self._call_json(
+            app, "POST", "/api/report", {"hours": 24, "device_ids": [merged["id"]]}
+        )
+        status, headers, body = self._call(
+            app,
+            "POST",
+            "/api/exports/queries",
+            {
+                "snapshot_token": report["snapshot_token"],
+                "format": "md",
+                "scope": "report",
+                "selector": {},
+            },
+        )
+        text = body.decode("utf-8")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["Content-Type"], "text/markdown; charset=utf-8")
+        self.assertTrue(headers["Content-Disposition"].endswith('.md"'))
+        self.assertIn("homeshield-dns-llm-v1", text)
+        self.assertIn('"activity_bucket_seconds": 300', text)
+        self.assertIn("## Chronological service activity", text)
+        self.assertIn('"first_query_local"', text)
+        self.assertIn('"domain":"llm-bucket.example"', text)
+        self.assertIn('"queries":2', text)
+        self.assertNotIn("snapshot_token", text)
 
     def test_snapshot_tampering_and_arbitrary_service_are_rejected(self) -> None:
         app = Application(self.settings)

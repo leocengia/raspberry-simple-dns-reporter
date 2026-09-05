@@ -166,6 +166,7 @@ function renderSignals(changes) {
     ? `Previous ${changes.baseline_days} days`
     : "No baseline";
   const list = document.querySelector("#signals-list");
+  document.querySelector("#export-all-md").hidden = !changes.signals.length;
   document.querySelector("#export-all-csv").hidden = !changes.signals.length;
   document.querySelector("#export-all-jsonl").hidden = !changes.signals.length;
   list.replaceChildren();
@@ -212,6 +213,7 @@ function renderSignals(changes) {
     actions.className = "query-actions";
     actions.append(
       actionButton("View queries", () => openQueryLog("signal", { signal_id: signal.signal_id }, signal.title)),
+      actionButton("Export LLM .md", () => exportQueries("md", "signal", { signal_id: signal.signal_id })),
       actionButton("Export CSV", () => exportQueries("csv", "signal", { signal_id: signal.signal_id })),
       actionButton("Export JSONL", () => exportQueries("jsonl", "signal", { signal_id: signal.signal_id })),
     );
@@ -584,18 +586,24 @@ document.querySelector("#view-service-queries").addEventListener("click", () => 
 document.querySelector("#export-service-csv").addEventListener("click", () => {
   if (currentService) exportQueries("csv", "service", { service_id: currentService.service_id });
 });
+document.querySelector("#export-service-md").addEventListener("click", () => {
+  if (currentService) exportQueries("md", "service", { service_id: currentService.service_id });
+});
 document.querySelector("#export-service-jsonl").addEventListener("click", () => {
   if (currentService) exportQueries("jsonl", "service", { service_id: currentService.service_id });
 });
+document.querySelector("#export-all-md").addEventListener("click", () => exportQueries("md", "all_signals", {}));
 document.querySelector("#export-all-csv").addEventListener("click", () => exportQueries("csv", "all_signals", {}));
 document.querySelector("#export-all-jsonl").addEventListener("click", () => exportQueries("jsonl", "all_signals", {}));
 document.querySelector("#apply-query-filters").addEventListener("click", () => loadQueryPage(true));
 elements.loadMore.addEventListener("click", () => loadQueryPage(false));
+document.querySelector("#export-query-md").addEventListener("click", () => exportQueries("md", undefined, undefined, true));
 document.querySelector("#export-query-csv").addEventListener("click", () => exportQueries("csv", undefined, undefined, true));
 document.querySelector("#export-query-jsonl").addEventListener("click", () => exportQueries("jsonl", undefined, undefined, true));
 document.querySelector("#download-json").addEventListener("click", () => {
   if (currentReport) downloadBlob(JSON.stringify(currentReport, null, 2), "application/json", "json");
 });
+document.querySelector("#download-llm").addEventListener("click", () => exportQueries("md", "report", {}));
 document.querySelector("#download-csv").addEventListener("click", downloadCsv);
 document.querySelector("#print-report").addEventListener("click", () => window.print());
 document.querySelectorAll('input[name="scope"]').forEach((input) => input.addEventListener("change", updateControls));

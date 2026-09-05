@@ -117,7 +117,10 @@ class PiHoleSource:
             normalized = _normalize_address(address)
             netalert = netalert_devices.get(normalized)
             pihole_name = _clean_name(row["pihole_name"])
-            display_name = pihole_name or (netalert.name if netalert else "") or address
+            # NetAlertX contains the user-confirmed inventory names. Pi-hole
+            # hostnames are useful fallbacks but are often generic (for example
+            # ``iPhone.lan``) and make multi-device/LLM reports ambiguous.
+            display_name = (netalert.name if netalert else "") or pihole_name or address
             hardware_key = _stable_hardware_key(hardware_by_address.get(normalized))
             stable_key = (netalert.stable_key if netalert else None) or hardware_key
             canonical_key = f"hardware:{stable_key}" if stable_key else f"client:{normalized}"

@@ -206,7 +206,7 @@ select { padding-right: 38px; }
 .muted { color: var(--muted); }
 .generated-at { margin-bottom: 0; font-size: .82rem; }
 .report-actions { text-align: right; }
-.report-actions > div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 9px; }
+.report-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-top: 9px; }
 .report-actions button {
   padding: 7px 10px;
   border: 1px solid var(--border);

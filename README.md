@@ -18,6 +18,7 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 - Service drill-down with timeline and top domains
 - Timestamped, paginated raw-query drill-down for services and review signals
 - Streaming CSV and JSONL evidence exports for a service, one signal, or all signals
+- LLM-ready Markdown exports for a whole report or any downloadable evidence slice
 - Stable device identity with safe disambiguation of duplicate display names
 - Per-service comparison between selected devices
 - Seven-day historical baseline with conservative change signals
@@ -162,6 +163,32 @@ baseline_start_local, baseline_end_local
 ```
 
 Fields unavailable in the installed Pi-hole schema are `null`/empty. Raw numeric codes are retained; labels are omitted unless the Reporter can state them safely. CSV values beginning with spreadsheet formula characters are prefixed with an apostrophe for safe opening; JSONL retains the original text. Timestamps use epoch seconds plus unambiguous UTC and `Europe/Rome` ISO-8601 forms, including DST offsets.
+
+### LLM-ready Markdown
+
+The `LLM report (.md)` action produces a self-describing Markdown evidence bundle suitable for direct upload to ChatGPT Work or local analysis with Codex CLI. Equivalent Markdown actions are available for one service, one review signal, all review signals, and a filtered query-log selection.
+
+The file contains:
+
+- a machine-readable schema/version, report boundaries, timezone, scope, devices, and classifier version;
+- an analysis contract that states what DNS evidence can and cannot prove;
+- aggregate metrics, ranked services, top domains, and conservative review signals;
+- chronological JSONL activity grouped into five-minute buckets by device and service;
+- exact first/last query timestamps, allowed/blocked counts, infrastructure attribution, classification confidence, and matching signal IDs/types;
+- six-hour section boundaries so a long report can be analyzed in manageable chunks.
+
+Five-minute grouping keeps repeated DNS chatter compact without losing the useful temporal bounds. The raw CSV and JSONL exports remain the authoritative per-query evidence when an exact event-by-event audit is needed. The Markdown export never includes the short-lived report snapshot token.
+
+Codex CLI can inspect a downloaded bundle with read-only filesystem access. For example:
+
+```sh
+codex exec --sandbox read-only --skip-git-repo-check --cd /path/to/reports \
+  "Analyze ./homeshield_llm-report_DEVICE_DATE.md. Follow the embedded Analysis contract, prioritize review signals and unknown/shared-infrastructure activity, and cite exact local intervals and domains."
+```
+
+`codex exec` is the supported non-interactive CLI workflow; `--cd` selects the report directory and `--sandbox read-only` prevents filesystem changes. See the [official Codex CLI command reference](https://developers.openai.com/codex/cli/reference).
+
+DNS bundles contain private browsing metadata. They remain local until the user explicitly gives the file to Codex, ChatGPT Work, or another service.
 
 `POST /api/queries` provides the same evidence as a bounded page (maximum 100 rows) for the UI. Both endpoints accept only server-issued snapshot tokens, known scopes/IDs, bounded text filters, known device IDs, and fixed report windows. They never accept SQL, regular expressions, or raw database predicates.
 

@@ -16,7 +16,7 @@ from .classifier import DomainClassifier
 from .database import SourceUnavailable, connect_readonly
 from .evidence import EvidenceSpec
 from .events import ROME, QueryEvent, normalize_event
-from .exports import safe_fragment, stream_csv, stream_jsonl
+from .exports import safe_fragment, stream_csv, stream_jsonl, stream_llm_markdown
 from .report import build_report
 from .settings import Settings
 from .snapshots import InvalidSnapshot, SnapshotSigner
@@ -301,7 +301,7 @@ class Application:
                 }
             )
         snapshot = {
-            "version": 1,
+            "version": 2,
             "context": report["report_context"],
             "clients": addresses,
             "devices": [
@@ -322,6 +322,31 @@ class Application:
                 }
                 for service in services  # type: ignore[union-attr]
             ],
+            "llm_report": {
+                "generated_at": report["generated_at"],
+                "range_kind": report["range_kind"],
+                "report_date": report["report_date"],
+                "complete_day": report["complete_day"],
+                "period_label": report["period_label"],
+                "report_context": report["report_context"],
+                "scope": report["scope"],
+                "overview": report["overview"],
+                "summary": report["summary"],
+                "caveat": report["caveat"],
+                "changes": report["changes"],
+                "services": [
+                    {
+                        key: service.get(key)
+                        for key in (
+                            "service_id", "service_name", "company", "category",
+                            "infrastructure_provider", "confidence", "queries",
+                            "blocked", "share", "unique_domains", "domains",
+                            "device_breakdown",
+                        )
+                    }
+                    for service in services  # type: ignore[union-attr]
+                ],
+            },
         }
         report["snapshot_token"] = self.snapshots.sign(snapshot)
 
@@ -397,6 +422,14 @@ class Application:
         selector = payload.get("selector")
         if not isinstance(selector, dict):
             raise ValueError("selector required")
+        if scope == "report":
+            llm_report = snapshot.get("llm_report")
+            if not isinstance(llm_report, dict):
+                raise InvalidSnapshot("report export is unavailable; generate a new report")
+            report_scope = llm_report.get("scope")
+            if not isinstance(report_scope, dict):
+                raise InvalidSnapshot("invalid report snapshot")
+            return scope, None, str(report_scope.get("display_name") or "report")
         if scope == "service":
             service_id = str(selector.get("service_id", ""))
             service = next(
@@ -445,9 +478,10 @@ class Application:
         if device_filter and device_filter not in known_device_ids:
             raise ValueError("unknown device")
         for event in self._event_iterator(snapshot, descending=descending):
-            memberships = self._memberships(event, snapshot) if scope in {"signal", "all_signals"} else []
+            memberships = self._memberships(event, snapshot)
             selected = (
-                event.service_id == selection if scope == "service"
+                True if scope == "report"
+                else event.service_id == selection if scope == "service"
                 else bool(memberships) if scope == "all_signals"
                 else selection.matches(event)
             )
@@ -480,7 +514,7 @@ class Application:
                 row = event.export_dict(
                     context,  # type: ignore[arg-type]
                     [str(item["signal_id"]) for item in memberships],
-                    [str(item["title"]) for item in memberships],
+                    [str(item["kind"]) for item in memberships],
                 )
                 rows.append(row)
             total += 1
@@ -518,7 +552,7 @@ class Application:
         snapshot: dict[str, object],
     ) -> Iterable[bytes]:
         export_format = str(payload.get("format", ""))
-        if export_format not in {"csv", "jsonl"}:
+        if export_format not in {"csv", "jsonl", "md"}:
             raise ValueError("unsupported export format")
         scope, _, label = self._selection(payload, snapshot)
         context = snapshot["context"]
@@ -528,18 +562,34 @@ class Application:
                 yield event.export_dict(
                     context,  # type: ignore[arg-type]
                     [str(item["signal_id"]) for item in memberships],
-                    [str(item["title"]) for item in memberships],
+                    [str(item["kind"]) for item in memberships],
                 )
 
         start = datetime.fromtimestamp(float(context["report_start_epoch"]), ROME).strftime("%Y%m%dT%H%M%z")
         end = datetime.fromtimestamp(float(context["report_end_epoch"]), ROME).strftime("%Y%m%dT%H%M%z")
-        prefix = "red-flags" if scope == "all_signals" else "red-flag" if scope == "signal" else "service"
+        prefix = (
+            "llm-report" if scope == "report"
+            else "red-flags" if scope == "all_signals"
+            else "red-flag" if scope == "signal"
+            else "service"
+        )
         filename = f"homeshield_{prefix}_{safe_fragment(label)}_{start}_{end}.{export_format}"
-        content_type = "text/csv; charset=utf-8" if export_format == "csv" else "application/x-ndjson; charset=utf-8"
+        content_type = (
+            "text/csv; charset=utf-8" if export_format == "csv"
+            else "application/x-ndjson; charset=utf-8" if export_format == "jsonl"
+            else "text/markdown; charset=utf-8"
+        )
         headers = self._security_headers(content_type)
         headers.append(("Content-Disposition", f'attachment; filename="{filename}"'))
         start_response("200 OK", headers)
-        return stream_csv(rows()) if export_format == "csv" else stream_jsonl(rows())
+        if export_format == "csv":
+            return stream_csv(rows())
+        if export_format == "jsonl":
+            return stream_jsonl(rows())
+        llm_report = snapshot.get("llm_report")
+        if not isinstance(llm_report, dict):
+            raise InvalidSnapshot("report export is unavailable; generate a new report")
+        return stream_llm_markdown(llm_report, rows(), scope=scope, label=label)
 
     @staticmethod
     def _headers(content_type: str, length: int) -> list[tuple[str, str]]:
