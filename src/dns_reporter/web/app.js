@@ -30,6 +30,16 @@ const elements = {
   queryCount: document.querySelector("#query-count"),
   queryEmpty: document.querySelector("#query-empty"),
   loadMore: document.querySelector("#load-more-queries"),
+  exportDialog: document.querySelector("#export-dialog"),
+  exportContent: document.querySelector("#export-content"),
+  exportFormat: document.querySelector("#export-format"),
+  exportDateFrom: document.querySelector("#export-date-from"),
+  exportDateTo: document.querySelector("#export-date-to"),
+  exportProgressWrap: document.querySelector("#export-progress-wrap"),
+  exportProgress: document.querySelector("#export-progress"),
+  exportStatus: document.querySelector("#export-status"),
+  startExport: document.querySelector("#start-export"),
+  cancelExport: document.querySelector("#cancel-export"),
 };
 
 let currentReport = null;
@@ -37,6 +47,7 @@ let availableGroups = [];
 let currentService = null;
 let queryState = null;
 let exportInProgress = false;
+let exportAbortController = null;
 
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
@@ -121,6 +132,8 @@ async function generateReport() {
       method: "POST",
       body: JSON.stringify(request),
     });
+    currentService = null;
+    queryState = null;
     renderReport(currentReport);
     elements.queryPanel.hidden = true;
   } catch (error) {
@@ -166,9 +179,6 @@ function renderSignals(changes) {
     ? `Previous ${changes.baseline_days} days`
     : "No baseline";
   const list = document.querySelector("#signals-list");
-  document.querySelector("#export-all-md").hidden = !changes.signals.length;
-  document.querySelector("#export-all-csv").hidden = !changes.signals.length;
-  document.querySelector("#export-all-jsonl").hidden = !changes.signals.length;
   list.replaceChildren();
   if (!changes.signals.length) {
     const empty = document.createElement("p");
@@ -213,9 +223,6 @@ function renderSignals(changes) {
     actions.className = "query-actions";
     actions.append(
       actionButton("View queries", () => openQueryLog("signal", { signal_id: signal.signal_id }, signal.title)),
-      actionButton("Export LLM .md", () => exportQueries("md", "signal", { signal_id: signal.signal_id })),
-      actionButton("Export CSV", () => exportQueries("csv", "signal", { signal_id: signal.signal_id })),
-      actionButton("Export JSONL", () => exportQueries("jsonl", "signal", { signal_id: signal.signal_id })),
     );
     item.append(actions);
     list.append(item);
@@ -436,44 +443,215 @@ function renderQueryRows(rows) {
   }
 }
 
-async function exportQueries(
-  format, scope = queryState?.scope, selector = queryState?.selector, useFilters = false,
-) {
-  if (!currentReport || !scope || !selector || exportInProgress) return;
-  exportInProgress = true;
+function openExportMenu(defaultContent = "queries") {
+  if (!currentReport || exportInProgress) return;
+  const serviceSelect = document.querySelector("#export-service");
+  serviceSelect.replaceChildren();
+  for (const service of currentReport.services) {
+    serviceSelect.append(new Option(`${service.service} · ${numberFormat.format(service.queries)}`, service.service_id));
+  }
+  if (currentService) serviceSelect.value = currentService.service_id;
+
+  const signalSelect = document.querySelector("#export-signal");
+  signalSelect.replaceChildren(new Option("All review signals", ""));
+  for (const signal of currentReport.changes.signals) {
+    signalSelect.append(new Option(signal.title, signal.signal_id));
+  }
+  elements.exportContent.querySelector('option[value="service"]').disabled = !currentReport.services.length;
+  elements.exportContent.querySelector('option[value="signals"]').disabled = !currentReport.changes.signals.length;
+  const currentQueryOption = elements.exportContent.querySelector('option[value="current-query"]');
+  currentQueryOption.disabled = !queryState || elements.queryPanel.hidden;
+  elements.exportContent.value = defaultContent;
+
+  const context = currentReport.report_context;
+  const firstDate = context.report_start_local.slice(0, 10);
+  const inclusiveEnd = new Date((context.report_end_epoch - 1) * 1000);
+  const endParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(inclusiveEnd);
+  const endValues = Object.fromEntries(endParts.map((part) => [part.type, part.value]));
+  const lastDate = `${endValues.year}-${endValues.month}-${endValues.day}`;
+  elements.exportDateFrom.value = firstDate;
+  elements.exportDateTo.value = lastDate;
+  elements.exportDateFrom.max = todayInRome();
+  elements.exportDateTo.max = todayInRome();
+  elements.exportProgressWrap.hidden = true;
+  elements.exportStatus.textContent = "Preparing export…";
+  updateExportControls();
+  elements.exportDialog.showModal();
+}
+
+function updateExportControls() {
+  const content = elements.exportContent.value;
+  const formats = {
+    queries: [["csv", "CSV"], ["jsonl", "JSONL"]],
+    llm: [["md", "LLM Markdown"]],
+    service: [["csv", "CSV"], ["jsonl", "JSONL"], ["md", "LLM Markdown"]],
+    signals: [["csv", "CSV"], ["jsonl", "JSONL"], ["md", "LLM Markdown"]],
+    "current-query": [["csv", "CSV"], ["jsonl", "JSONL"], ["md", "LLM Markdown"]],
+    presence: [["csv", "CSV"], ["jsonl", "JSONL"]],
+    services: [["csv", "CSV"]],
+    "report-json": [["json", "JSON"]],
+    print: [["pdf", "Browser print / PDF"]],
+  };
+  elements.exportFormat.replaceChildren(...formats[content].map(([value, label]) => new Option(label, value)));
+  document.querySelector("#export-service-control").hidden = content !== "service";
+  document.querySelector("#export-signal-control").hidden = content !== "signals";
+  const supportsCustomDates = ["queries", "llm", "service", "presence"].includes(content);
+  document.querySelector("#export-dates").hidden = !supportsCustomDates;
+  document.querySelector("#export-range-hint").textContent = supportsCustomDates
+    ? "Calendar days in Europe/Rome, including both selected dates (maximum 366 days)."
+    : content === "current-query" || content === "signals"
+      ? "Review-signal selections keep the exact time window of the generated report."
+      : "This export uses the currently generated report.";
+  elements.startExport.disabled = content === "service" && !document.querySelector("#export-service").value;
+}
+
+function setExportBusy(busy) {
+  exportInProgress = busy;
+  elements.exportContent.disabled = busy;
+  elements.exportFormat.disabled = busy;
+  elements.exportDateFrom.disabled = busy;
+  elements.exportDateTo.disabled = busy;
+  document.querySelector("#export-service").disabled = busy;
+  document.querySelector("#export-signal").disabled = busy;
+  elements.startExport.disabled = busy;
+  elements.cancelExport.textContent = busy ? "Cancel download" : "Close";
+}
+
+async function startExport() {
+  if (!currentReport || exportInProgress) return;
+  const content = elements.exportContent.value;
+  const format = elements.exportFormat.value;
   hideError();
+  elements.exportProgressWrap.hidden = false;
+  elements.exportProgress.removeAttribute("value");
+  elements.exportStatus.textContent = "Preparing export…";
+
+  if (content === "print") {
+    elements.exportDialog.close();
+    window.print();
+    return;
+  }
+  if (content === "report-json" || content === "services") {
+    elements.exportProgress.value = 35;
+    elements.exportStatus.textContent = "Preparing file…";
+    if (content === "report-json") {
+      const report = { ...currentReport };
+      delete report.snapshot_token;
+      downloadBlob(JSON.stringify(report, null, 2), "application/json", "json");
+    } else {
+      downloadCsv();
+    }
+    elements.exportProgress.value = 100;
+    elements.exportStatus.textContent = "Download started.";
+    return;
+  }
+
+  const customDates = ["queries", "llm", "service", "presence"].includes(content);
+  if (customDates && (!elements.exportDateFrom.value || !elements.exportDateTo.value
+      || elements.exportDateFrom.value > elements.exportDateTo.value)) {
+    elements.exportProgressWrap.hidden = true;
+    showError("Choose a valid export date range.");
+    return;
+  }
+  const payload = {
+    snapshot_token: currentReport.snapshot_token,
+    format,
+  };
+  if (customDates) {
+    payload.date_from = elements.exportDateFrom.value;
+    payload.date_to = elements.exportDateTo.value;
+  }
+  let endpoint = "/api/exports/queries";
+  if (content === "presence") {
+    endpoint = "/api/exports/presence";
+  } else if (content === "queries" || content === "llm") {
+    payload.scope = "report";
+    payload.selector = {};
+  } else if (content === "service") {
+    payload.scope = "service";
+    payload.selector = { service_id: document.querySelector("#export-service").value };
+  } else if (content === "signals") {
+    const signalId = document.querySelector("#export-signal").value;
+    payload.scope = signalId ? "signal" : "all_signals";
+    payload.selector = signalId ? { signal_id: signalId } : {};
+  } else if (content === "current-query") {
+    payload.scope = queryState.scope;
+    payload.selector = queryState.selector;
+    payload.domain_filter = document.querySelector("#query-domain-filter").value;
+    payload.device_id = document.querySelector("#query-device-filter").value;
+  }
+
+  setExportBusy(true);
+  exportAbortController = new AbortController();
   try {
-    const response = await fetch("/api/exports/queries", {
+    const response = await fetch(endpoint, {
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        snapshot_token: currentReport.snapshot_token,
-        format, scope, selector,
-        domain_filter: useFilters ? document.querySelector("#query-domain-filter").value : "",
-        device_id: useFilters ? document.querySelector("#query-device-filter").value : "",
-      }),
+      body: JSON.stringify(payload),
+      signal: exportAbortController.signal,
     });
     if (!response.ok) {
       const error = await response.json();
       throw new Error(error.error || `Export failed (${response.status})`);
     }
-    const blob = await response.blob();
+    const blob = await readExportResponse(response);
     const disposition = response.headers.get("Content-Disposition") || "";
-    const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `homeshield-queries.${format}`;
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const filename = disposition.match(/filename="([^"]+)"/)?.[1]
+      || `homeshield-export.${format}`;
+    triggerBlobDownload(blob, filename);
+    elements.exportProgress.value = 100;
+    elements.exportStatus.textContent = "Download started.";
   } catch (error) {
-    showError(error.message);
+    if (error.name === "AbortError") {
+      elements.exportStatus.textContent = "Download cancelled.";
+    } else {
+      elements.exportStatus.textContent = "Export failed.";
+      showError(error.message);
+    }
   } finally {
-    exportInProgress = false;
+    exportAbortController = null;
+    setExportBusy(false);
   }
+}
+
+async function readExportResponse(response) {
+  if (!response.body) return response.blob();
+  const total = Number(response.headers.get("Content-Length") || 0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  if (!total) elements.exportProgress.removeAttribute("value");
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    if (total) elements.exportProgress.value = Math.min(99, (received / total) * 100);
+    elements.exportStatus.textContent = total
+      ? `Downloading… ${Math.round((received / total) * 100)}%`
+      : `Downloading… ${formatBytes(received)} received`;
+  }
+  return new Blob(chunks, { type: response.headers.get("Content-Type") || "application/octet-stream" });
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function showError(message) {
@@ -583,29 +761,24 @@ document.querySelector("#close-query-panel").addEventListener("click", () => { e
 document.querySelector("#view-service-queries").addEventListener("click", () => {
   if (currentService) openQueryLog("service", { service_id: currentService.service_id }, currentService.service_name);
 });
-document.querySelector("#export-service-csv").addEventListener("click", () => {
-  if (currentService) exportQueries("csv", "service", { service_id: currentService.service_id });
-});
-document.querySelector("#export-service-md").addEventListener("click", () => {
-  if (currentService) exportQueries("md", "service", { service_id: currentService.service_id });
-});
-document.querySelector("#export-service-jsonl").addEventListener("click", () => {
-  if (currentService) exportQueries("jsonl", "service", { service_id: currentService.service_id });
-});
-document.querySelector("#export-all-md").addEventListener("click", () => exportQueries("md", "all_signals", {}));
-document.querySelector("#export-all-csv").addEventListener("click", () => exportQueries("csv", "all_signals", {}));
-document.querySelector("#export-all-jsonl").addEventListener("click", () => exportQueries("jsonl", "all_signals", {}));
 document.querySelector("#apply-query-filters").addEventListener("click", () => loadQueryPage(true));
 elements.loadMore.addEventListener("click", () => loadQueryPage(false));
-document.querySelector("#export-query-md").addEventListener("click", () => exportQueries("md", undefined, undefined, true));
-document.querySelector("#export-query-csv").addEventListener("click", () => exportQueries("csv", undefined, undefined, true));
-document.querySelector("#export-query-jsonl").addEventListener("click", () => exportQueries("jsonl", undefined, undefined, true));
-document.querySelector("#download-json").addEventListener("click", () => {
-  if (currentReport) downloadBlob(JSON.stringify(currentReport, null, 2), "application/json", "json");
+document.querySelector("#open-export").addEventListener("click", () => openExportMenu());
+document.querySelector("#close-export").addEventListener("click", () => {
+  if (!exportInProgress) elements.exportDialog.close();
 });
-document.querySelector("#download-llm").addEventListener("click", () => exportQueries("md", "report", {}));
-document.querySelector("#download-csv").addEventListener("click", downloadCsv);
-document.querySelector("#print-report").addEventListener("click", () => window.print());
+elements.cancelExport.addEventListener("click", () => {
+  if (exportAbortController) exportAbortController.abort();
+  else elements.exportDialog.close();
+});
+elements.startExport.addEventListener("click", startExport);
+elements.exportContent.addEventListener("change", updateExportControls);
+elements.exportDialog.addEventListener("cancel", (event) => {
+  if (exportInProgress) {
+    event.preventDefault();
+    exportAbortController?.abort();
+  }
+});
 document.querySelectorAll('input[name="scope"]').forEach((input) => input.addEventListener("change", updateControls));
 document.querySelectorAll('input[name="period-mode"]').forEach((input) => input.addEventListener("change", updateControls));
 elements.reportDate.addEventListener("change", updateControls);

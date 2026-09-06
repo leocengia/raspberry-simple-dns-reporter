@@ -21,6 +21,12 @@ EXPORT_COLUMNS = (
     "report_end_local", "baseline_start_local", "baseline_end_local",
 )
 
+PRESENCE_COLUMNS = (
+    "event_id", "timestamp_local", "timestamp_epoch", "timezone",
+    "canonical_device_id", "device_name", "state", "source", "confidence",
+    "detail", "report_start_local", "report_end_local",
+)
+
 LLM_SCHEMA_VERSION = "homeshield-dns-llm-v1"
 LLM_ACTIVITY_BUCKET_SECONDS = 300
 LLM_CHUNK_HOURS = 6
@@ -40,6 +46,22 @@ def stream_csv(rows: Iterable[Mapping[str, object]]) -> Iterator[bytes]:
 def stream_jsonl(rows: Iterable[Mapping[str, object]]) -> Iterator[bytes]:
     for row in rows:
         ordered = {column: row.get(column) for column in EXPORT_COLUMNS}
+        yield (json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def stream_presence_csv(rows: Iterable[Mapping[str, object]]) -> Iterator[bytes]:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(PRESENCE_COLUMNS)
+    yield b"\xef\xbb\xbf" + _take(buffer)
+    for row in rows:
+        writer.writerow([_spreadsheet_safe(row.get(column)) for column in PRESENCE_COLUMNS])
+        yield _take(buffer)
+
+
+def stream_presence_jsonl(rows: Iterable[Mapping[str, object]]) -> Iterator[bytes]:
+    for row in rows:
+        ordered = {column: row.get(column) for column in PRESENCE_COLUMNS}
         yield (json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 

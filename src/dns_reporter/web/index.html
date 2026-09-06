@@ -84,10 +84,7 @@
           <div class="report-actions">
             <p id="generated-at" class="muted generated-at"></p>
             <div>
-              <button type="button" id="download-llm">LLM report (.md)</button>
-              <button type="button" id="download-json">JSON</button>
-              <button type="button" id="download-csv">CSV</button>
-              <button type="button" id="print-report">Print / PDF</button>
+              <button type="button" id="open-export">Export data…</button>
             </div>
           </div>
         </section>
@@ -134,9 +131,6 @@
             </div>
             <div class="panel-actions">
               <span id="baseline-label" class="chip"></span>
-              <button type="button" id="export-all-md" hidden>Export all LLM .md</button>
-              <button type="button" id="export-all-csv" hidden>Export all CSV</button>
-              <button type="button" id="export-all-jsonl" hidden>Export all JSONL</button>
             </div>
           </div>
           <div id="signals-list" class="signals-list"></div>
@@ -180,9 +174,6 @@
           </p>
           <div class="query-actions">
             <button type="button" id="view-service-queries">View query log</button>
-            <button type="button" id="export-service-md">Export LLM .md</button>
-            <button type="button" id="export-service-csv">Export CSV</button>
-            <button type="button" id="export-service-jsonl">Export JSONL</button>
           </div>
           <div id="service-chart" class="timeline-chart compact" role="img"></div>
           <div id="device-comparison" class="device-comparison" hidden>
@@ -208,11 +199,6 @@
             <label>Time order<select id="query-sort"><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label>
             <button type="button" id="apply-query-filters">Apply</button>
           </div>
-          <div class="query-actions">
-            <button type="button" id="export-query-md">Export LLM .md</button>
-            <button type="button" id="export-query-csv">Export CSV</button>
-            <button type="button" id="export-query-jsonl">Export JSONL</button>
-          </div>
           <div class="query-table-wrap">
             <table class="query-table">
               <thead><tr><th>Time (Europe/Rome)</th><th>Device</th><th>Domain</th><th>Service / infrastructure</th><th>Status</th></tr></thead>
@@ -224,6 +210,57 @@
           <p class="privacy-note">Exports contain DNS name-resolution events, not full URLs, contents, searches, usage duration, or transferred data.</p>
         </section>
       </div>
+
+      <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-title">
+        <div class="export-heading">
+          <div>
+            <p class="eyebrow">Download centre</p>
+            <h2 id="export-title">Export data</h2>
+          </div>
+          <button type="button" class="close-button" id="close-export" aria-label="Close export menu">Close</button>
+        </div>
+        <div class="export-form">
+          <label>
+            <span>What to export</span>
+            <select id="export-content">
+              <option value="queries">Complete DNS queries</option>
+              <option value="llm">LLM evidence report</option>
+              <option value="service">Queries for one service</option>
+              <option value="signals">Queries matching review signals</option>
+              <option value="current-query">Current query-log selection</option>
+              <option value="presence">Connections and disconnections</option>
+              <option value="services">Services summary</option>
+              <option value="report-json">Aggregated report data</option>
+              <option value="print">Print / save as PDF</option>
+            </select>
+          </label>
+          <label id="export-service-control" hidden>
+            <span>Service</span>
+            <select id="export-service"></select>
+          </label>
+          <label id="export-signal-control" hidden>
+            <span>Review signal</span>
+            <select id="export-signal"></select>
+          </label>
+          <label>
+            <span>Format</span>
+            <select id="export-format"></select>
+          </label>
+          <div class="export-dates" id="export-dates">
+            <label><span>From</span><input id="export-date-from" type="date"></label>
+            <label><span>To (included)</span><input id="export-date-to" type="date"></label>
+          </div>
+          <p id="export-range-hint" class="muted export-hint"></p>
+        </div>
+        <div id="export-progress-wrap" class="export-progress" hidden>
+          <progress id="export-progress" max="100"></progress>
+          <p id="export-status" aria-live="polite">Preparing export…</p>
+        </div>
+        <div class="export-footer">
+          <button type="button" id="cancel-export">Cancel</button>
+          <button type="button" id="start-export">Download</button>
+        </div>
+      </dialog>
     </main>
   </body>
 </html>

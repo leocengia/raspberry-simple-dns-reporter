@@ -15,8 +15,15 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from .classifier import DomainClassifier
 from .database import SourceUnavailable, connect_readonly
 from .evidence import EvidenceSpec
-from .events import ROME, QueryEvent, normalize_event
-from .exports import safe_fragment, stream_csv, stream_jsonl, stream_llm_markdown
+from .events import ROME, QueryEvent, iso_timestamp, normalize_event
+from .exports import (
+    safe_fragment,
+    stream_csv,
+    stream_jsonl,
+    stream_llm_markdown,
+    stream_presence_csv,
+    stream_presence_jsonl,
+)
 from .report import build_report
 from .settings import Settings
 from .snapshots import InvalidSnapshot, SnapshotSigner
@@ -25,6 +32,8 @@ from .sources import NetAlertXSource, PiHoleSource
 
 LOGGER = logging.getLogger("dns-reporter")
 ALLOWED_HOURS = (3, 6, 12, 24, 48, 168)
+EXPORT_MAX_DAYS = 366
+DNS_PRESENCE_GAP_SECONDS = 30 * 60
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -48,9 +57,9 @@ class QuietRequestHandler(WSGIRequestHandler):
 class Application:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        netalertx = NetAlertXSource(settings.netalertx_db)
+        self.netalertx = NetAlertXSource(settings.netalertx_db)
         self.pihole = PiHoleSource(
-            settings.pihole_db, netalertx, settings.gravity_db
+            settings.pihole_db, self.netalertx, settings.gravity_db
         )
         self.classifier = DomainClassifier.from_file(settings.service_map)
         self.snapshots = SnapshotSigner.ephemeral()
@@ -157,6 +166,10 @@ class Application:
                 payload = self._read_json(environ, max_length=131072)
                 snapshot = self._validate_snapshot(str(payload.get("snapshot_token", "")))
                 return self._export(start_response, payload, snapshot)
+            if method == "POST" and path == "/api/exports/presence":
+                payload = self._read_json(environ, max_length=131072)
+                snapshot = self._validate_snapshot(str(payload.get("snapshot_token", "")))
+                return self._export_presence(start_response, payload, snapshot)
             if method == "GET" and path in STATIC_FILES:
                 filename, content_type = STATIC_FILES[path]
                 return self._file(start_response, filename, content_type)
@@ -394,9 +407,15 @@ class Application:
         return snapshot
 
     def _event_iterator(
-        self, snapshot: dict[str, object], *, descending: bool
+        self,
+        snapshot: dict[str, object],
+        *,
+        descending: bool,
+        context: dict[str, object] | None = None,
     ) -> Iterable[QueryEvent]:
-        context = snapshot["context"]
+        active_context = context or snapshot.get("context")
+        if not isinstance(active_context, dict):
+            raise InvalidSnapshot("invalid report snapshot")
         devices = snapshot["devices"]
         devices_by_address = {
             str(address): device
@@ -405,8 +424,8 @@ class Application:
         }
         rows = self.pihole.query_range(
             [str(client) for client in snapshot["clients"]],  # type: ignore[index]
-            float(context["report_start_epoch"]),  # type: ignore[index]
-            float(context["report_end_epoch"]),  # type: ignore[index]
+            float(active_context["report_start_epoch"]),
+            float(active_context["report_end_epoch"]),
             descending=descending,
         )
         for row in rows:  # type: ignore[union-attr]
@@ -468,6 +487,7 @@ class Application:
         snapshot: dict[str, object],
         *,
         descending: bool,
+        context: dict[str, object] | None = None,
     ):
         scope, selection, _ = self._selection(payload, snapshot)
         domain_filter = str(payload.get("domain_filter", "")).strip().lower()
@@ -477,7 +497,7 @@ class Application:
         known_device_ids = {str(item["id"]) for item in snapshot["devices"]}  # type: ignore[index]
         if device_filter and device_filter not in known_device_ids:
             raise ValueError("unknown device")
-        for event in self._event_iterator(snapshot, descending=descending):
+        for event in self._event_iterator(snapshot, descending=descending, context=context):
             memberships = self._memberships(event, snapshot)
             selected = (
                 True if scope == "report"
@@ -555,12 +575,14 @@ class Application:
         if export_format not in {"csv", "jsonl", "md"}:
             raise ValueError("unsupported export format")
         scope, _, label = self._selection(payload, snapshot)
-        context = snapshot["context"]
+        context = self._export_context(payload, snapshot)
 
         def rows():
-            for event, memberships in self._matching_events(payload, snapshot, descending=False):
+            for event, memberships in self._matching_events(
+                payload, snapshot, descending=False, context=context
+            ):
                 yield event.export_dict(
-                    context,  # type: ignore[arg-type]
+                    context,
                     [str(item["signal_id"]) for item in memberships],
                     [str(item["kind"]) for item in memberships],
                 )
@@ -589,7 +611,192 @@ class Application:
         llm_report = snapshot.get("llm_report")
         if not isinstance(llm_report, dict):
             raise InvalidSnapshot("report export is unavailable; generate a new report")
-        return stream_llm_markdown(llm_report, rows(), scope=scope, label=label)
+        export_report = dict(llm_report)
+        export_report["report_context"] = context
+        if context.get("range_kind") == "export_range":
+            export_report["overview"] = {
+                "note": (
+                    "Custom calendar range: use the chronological activity rows below "
+                    "as the authoritative contents of this export."
+                )
+            }
+            export_report["summary"] = (
+                "This evidence bundle covers the custom calendar range selected at export time."
+            )
+            export_report["changes"] = {"signals": []}
+            export_report["services"] = []
+        return stream_llm_markdown(export_report, rows(), scope=scope, label=label)
+
+    @staticmethod
+    def _export_context(
+        payload: dict[str, object], snapshot: dict[str, object]
+    ) -> dict[str, object]:
+        date_from = str(payload.get("date_from", "")).strip()
+        date_to = str(payload.get("date_to", "")).strip()
+        original = snapshot.get("context")
+        if not isinstance(original, dict):
+            raise InvalidSnapshot("invalid report snapshot")
+        if not date_from and not date_to:
+            return dict(original)
+        if not date_from or not date_to:
+            raise ValueError("both export dates are required")
+        try:
+            first_day = datetime.strptime(date_from, "%Y-%m-%d").date()
+            last_day = datetime.strptime(date_to, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("invalid export date range") from exc
+        now = datetime.now(ROME)
+        if first_day > last_day or last_day > now.date():
+            raise ValueError("invalid export date range")
+        day_count = (last_day - first_day).days + 1
+        if day_count > EXPORT_MAX_DAYS:
+            raise ValueError(f"export range cannot exceed {EXPORT_MAX_DAYS} days")
+        start = datetime.combine(first_day, datetime.min.time(), tzinfo=ROME).timestamp()
+        next_day = datetime.combine(
+            last_day + timedelta(days=1), datetime.min.time(), tzinfo=ROME
+        ).timestamp()
+        end = min(next_day, now.timestamp())
+        if not start < end:
+            raise ValueError("invalid export date range")
+        context = dict(original)
+        context.update(
+            {
+                "hours": round((end - start) / 3600, 6),
+                "range_kind": "export_range",
+                "report_date": None,
+                "complete_day": last_day < now.date(),
+                "period_label": f"{date_from} – {date_to}",
+                "report_start_epoch": start,
+                "report_end_epoch": end,
+                "report_start_local": iso_timestamp(start, ROME),
+                "report_end_local": iso_timestamp(end, ROME),
+                "baseline_start_local": None,
+                "baseline_end_local": None,
+            }
+        )
+        return context
+
+    def _export_presence(
+        self,
+        start_response: Callable[..., object],
+        payload: dict[str, object],
+        snapshot: dict[str, object],
+    ) -> Iterable[bytes]:
+        export_format = str(payload.get("format", ""))
+        if export_format not in {"csv", "jsonl"}:
+            raise ValueError("unsupported presence export format")
+        context = self._export_context(payload, snapshot)
+        devices = snapshot.get("devices")
+        if not isinstance(devices, list):
+            raise InvalidSnapshot("invalid report snapshot")
+        rows = self._presence_rows(devices, snapshot, context)
+        label = str(
+            ((snapshot.get("llm_report") or {}).get("scope") or {}).get(
+                "display_name", "devices"
+            )
+        )
+        start = datetime.fromtimestamp(float(context["report_start_epoch"]), ROME).strftime("%Y%m%d")
+        end = datetime.fromtimestamp(float(context["report_end_epoch"]), ROME).strftime("%Y%m%d")
+        filename = (
+            f"homeshield_presence_{safe_fragment(label)}_{start}_{end}.{export_format}"
+        )
+        content_type = (
+            "text/csv; charset=utf-8"
+            if export_format == "csv"
+            else "application/x-ndjson; charset=utf-8"
+        )
+        headers = self._security_headers(content_type)
+        headers.append(("Content-Disposition", f'attachment; filename="{filename}"'))
+        start_response("200 OK", headers)
+        if export_format == "csv":
+            return stream_presence_csv(rows)
+        return stream_presence_jsonl(rows)
+
+    def _presence_rows(
+        self,
+        devices: list[dict[str, object]],
+        snapshot: dict[str, object],
+        context: dict[str, object],
+    ) -> list[dict[str, object]]:
+        start = float(context["report_start_epoch"])
+        end = float(context["report_end_epoch"])
+        try:
+            available, rows = self.netalertx.presence_events(devices, start, end)
+        except (SourceUnavailable, sqlite3.Error):
+            available, rows = False, []
+        if not available:
+            rows = self._infer_presence_from_dns(snapshot, context)
+        for row in rows:
+            row["report_start_local"] = context["report_start_local"]
+            row["report_end_local"] = context["report_end_local"]
+        return rows
+
+    def _infer_presence_from_dns(
+        self, snapshot: dict[str, object], context: dict[str, object]
+    ) -> list[dict[str, object]]:
+        start = float(context["report_start_epoch"])
+        end = float(context["report_end_epoch"])
+        last_seen: dict[str, tuple[float, str]] = {}
+        rows: list[dict[str, object]] = []
+
+        def inferred(epoch: float, device_id: str, name: str, state: str, detail: str):
+            rows.append(
+                {
+                    "event_id": f"dns:{device_id}:{int(epoch)}:{state}",
+                    "timestamp_epoch": int(epoch) if epoch.is_integer() else epoch,
+                    "timestamp_local": iso_timestamp(epoch, ROME),
+                    "timezone": "Europe/Rome",
+                    "canonical_device_id": device_id,
+                    "device_name": name,
+                    "state": state,
+                    "source": "dns_activity",
+                    "confidence": "estimated",
+                    "detail": detail,
+                }
+            )
+
+        for event in self._event_iterator(
+            snapshot, descending=False, context=context
+        ):
+            identifier = event.canonical_device_id
+            epoch = float(event.timestamp_epoch)
+            previous = last_seen.get(identifier)
+            if previous is None:
+                inferred(
+                    epoch,
+                    identifier,
+                    event.device_name,
+                    "connected",
+                    "First DNS activity observed in the selected range",
+                )
+            elif epoch - previous[0] >= DNS_PRESENCE_GAP_SECONDS:
+                inferred(
+                    previous[0] + DNS_PRESENCE_GAP_SECONDS,
+                    identifier,
+                    previous[1],
+                    "disconnected",
+                    "No DNS activity observed for 30 minutes",
+                )
+                inferred(
+                    epoch,
+                    identifier,
+                    event.device_name,
+                    "connected",
+                    "DNS activity resumed after at least 30 minutes",
+                )
+            last_seen[identifier] = (epoch, event.device_name)
+
+        for identifier, (epoch, name) in last_seen.items():
+            if end - epoch >= DNS_PRESENCE_GAP_SECONDS:
+                inferred(
+                    epoch + DNS_PRESENCE_GAP_SECONDS,
+                    identifier,
+                    name,
+                    "disconnected",
+                    "No DNS activity observed for 30 minutes",
+                )
+        rows.sort(key=lambda row: (float(row["timestamp_epoch"]), str(row["device_name"])))
+        return rows
 
     @staticmethod
     def _headers(content_type: str, length: int) -> list[tuple[str, str]]:

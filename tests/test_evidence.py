@@ -19,7 +19,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from dns_reporter.classifier import DomainClassifier  # noqa: E402
 from dns_reporter.events import ROME, iso_timestamp  # noqa: E402
-from dns_reporter.exports import EXPORT_COLUMNS, stream_csv, stream_jsonl  # noqa: E402
+from dns_reporter.exports import (  # noqa: E402
+    EXPORT_COLUMNS,
+    PRESENCE_COLUMNS,
+    stream_csv,
+    stream_jsonl,
+)
 from dns_reporter.server import Application  # noqa: E402
 from dns_reporter.settings import Settings  # noqa: E402
 from dns_reporter.sources import NetAlertXSource, PiHoleSource  # noqa: E402
@@ -196,7 +201,7 @@ class EvidenceTestCase(unittest.TestCase):
         self.assertTrue(csv_rows[0]["timestamp_utc"])
 
     def test_llm_markdown_report_is_self_describing_and_time_bucketed(self) -> None:
-        bucket = self.now - (self.now % 300)
+        bucket = self.now - (self.now % 300) - 300
         with closing(sqlite3.connect(self.pihole_db)) as connection, connection:
             connection.executemany(
                 "INSERT INTO queries(timestamp,type,status,domain,client) VALUES (?,?,?,?,?)",
@@ -233,6 +238,107 @@ class EvidenceTestCase(unittest.TestCase):
         self.assertIn('"domain":"llm-bucket.example"', text)
         self.assertIn('"queries":2', text)
         self.assertNotIn("snapshot_token", text)
+
+    def test_complete_query_export_accepts_an_independent_calendar_range(self) -> None:
+        app = Application(self.settings)
+        devices = self._call_json(app, "GET", "/api/devices")["devices"]
+        merged = next(device for device in devices if len(device["addresses"]) == 2)
+        report = self._call_json(
+            app, "POST", "/api/report", {"hours": 24, "device_ids": [merged["id"]]}
+        )
+        older_day = datetime.fromtimestamp(self.now - 2 * 86400, ROME).date().isoformat()
+        status, _, body = self._call(
+            app,
+            "POST",
+            "/api/exports/queries",
+            {
+                "snapshot_token": report["snapshot_token"],
+                "format": "jsonl",
+                "scope": "report",
+                "selector": {},
+                "date_from": older_day,
+                "date_to": older_day,
+            },
+        )
+        rows = [json.loads(line) for line in body.splitlines()]
+        self.assertEqual(status, "200 OK")
+        self.assertEqual([row["domain"] for row in rows], ["known.example"])
+        self.assertTrue(rows[0]["report_start_local"].startswith(older_day))
+
+    def test_export_calendar_range_is_bounded(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot exceed 366 days"):
+            Application._export_context(
+                {"date_from": "2024-01-01", "date_to": "2025-01-02"},
+                {"context": {}},
+            )
+
+    def test_presence_export_uses_netalertx_connection_events(self) -> None:
+        event_time = datetime.fromtimestamp(self.now - 60, ROME).strftime("%Y-%m-%d %H:%M:%S")
+        with closing(sqlite3.connect(self.netalertx_db)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE Events (
+                    eve_MAC TEXT, eve_IP TEXT, eve_DateTime TEXT,
+                    eve_EventType TEXT, eve_AdditionalInfo TEXT
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO Events VALUES (?,?,?,?,?)",
+                [
+                    ("02:00:00:00:00:10", "192.0.2.10", event_time, "Connected", "Wi-Fi seen"),
+                    ("02:00:00:00:00:10", "192.0.2.10", event_time, "Disconnected", "Wi-Fi lost"),
+                ],
+            )
+        app = Application(self.settings)
+        devices = self._call_json(app, "GET", "/api/devices")["devices"]
+        merged = next(device for device in devices if len(device["addresses"]) == 2)
+        report = self._call_json(
+            app, "POST", "/api/report", {"hours": 24, "device_ids": [merged["id"]]}
+        )
+        day = datetime.fromtimestamp(self.now - 60, ROME).date().isoformat()
+        status, headers, body = self._call(
+            app,
+            "POST",
+            "/api/exports/presence",
+            {
+                "snapshot_token": report["snapshot_token"],
+                "format": "csv",
+                "date_from": day,
+                "date_to": day,
+            },
+        )
+        rows = list(csv.DictReader(io.StringIO(body.decode("utf-8-sig"))))
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["Content-Type"], "text/csv; charset=utf-8")
+        self.assertEqual(tuple(rows[0]), PRESENCE_COLUMNS)
+        self.assertEqual([row["state"] for row in rows], ["connected", "disconnected"])
+        self.assertEqual(rows[0]["source"], "netalertx")
+        self.assertEqual(rows[0]["confidence"], "observed")
+
+    def test_presence_export_labels_dns_only_fallback_as_estimated(self) -> None:
+        app = Application(self.settings)
+        devices = self._call_json(app, "GET", "/api/devices")["devices"]
+        merged = next(device for device in devices if len(device["addresses"]) == 2)
+        report = self._call_json(
+            app, "POST", "/api/report", {"hours": 24, "device_ids": [merged["id"]]}
+        )
+        day = datetime.fromtimestamp(self.now - 100, ROME).date().isoformat()
+        status, _, body = self._call(
+            app,
+            "POST",
+            "/api/exports/presence",
+            {
+                "snapshot_token": report["snapshot_token"],
+                "format": "jsonl",
+                "date_from": day,
+                "date_to": day,
+            },
+        )
+        self.assertEqual(status, "200 OK")
+        payload = json.loads(body.splitlines()[0])
+        self.assertEqual(payload["source"], "dns_activity")
+        self.assertEqual(payload["confidence"], "estimated")
 
     def test_snapshot_tampering_and_arbitrary_service_are_rejected(self) -> None:
         app = Application(self.settings)

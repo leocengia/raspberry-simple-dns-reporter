@@ -17,6 +17,10 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 - DNS activity timeline
 - Service drill-down with timeline and top domains
 - Timestamped, paginated raw-query drill-down for services and review signals
+- One export menu for complete queries, services, review signals, current filters, and aggregate data
+- Custom inclusive calendar-date ranges (up to 366 days) for raw DNS and presence exports
+- Connection/disconnection exports from NetAlertX, with an explicit DNS-activity estimate fallback
+- Visible, cancellable download progress for server-side exports
 - Streaming CSV and JSONL evidence exports for a service, one signal, or all signals
 - LLM-ready Markdown exports for a whole report or any downloadable evidence slice
 - Stable device identity with safe disambiguation of duplicate display names
@@ -39,7 +43,7 @@ Browser
   <- HTML, JSON, CSS and JavaScript
 ```
 
-Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; a selected calendar day runs from local midnight to the next local midnight (or to the generation time when selecting today). Subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
+Pi-hole remains the authoritative DNS source. NetAlertX supplies device metadata and, when its compatible `Events` table is present, connection state changes. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; a selected calendar day runs from local midnight to the next local midnight (or to the generation time when selecting today). Subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
 
 ## Requirements
 
@@ -147,7 +151,13 @@ never existed or is malicious.
 
 ## Export behavior
 
-The aggregate report still supports browser-side JSON, CSV, and print/PDF. Raw query evidence uses `POST /api/exports/queries` and is serialized incrementally from read-only SQLite rows; the server does not persist files or materialize the complete export in memory. Supported scopes are one `signal_id`, all signals (deduplicated by Pi-hole query ID), or one stable `service_id`. Formats are UTF-8 CSV and JSONL/NDJSON.
+The report header has one download centre instead of format buttons scattered across individual sections. It can export complete DNS queries, an LLM evidence bundle, one service, all or one review signal, the currently filtered query log, connection state changes, the service summary, aggregate JSON, or print/PDF.
+
+Raw query evidence uses `POST /api/exports/queries` and is serialized incrementally from read-only SQLite rows; the server does not persist files or materialize the complete export in memory. Supported scopes are the whole selected device set, one `signal_id`, all signals (deduplicated by Pi-hole query ID), or one stable `service_id`. Formats are UTF-8 CSV, JSONL/NDJSON, and LLM-ready Markdown. Complete-query, service, LLM, and presence exports accept an inclusive `date_from`/`date_to` calendar range in `Europe/Rome`, limited to 366 days and capped at the current time for today.
+
+`POST /api/exports/presence` produces a compact CSV or JSONL connection/disconnection history. When NetAlertX exposes a compatible `Events` table, rows are marked `source=netalertx` and `confidence=observed`. If that table is unavailable, the Reporter falls back to conservative DNS-activity sessions: a 30-minute gap becomes an estimated disconnection and later activity an estimated reconnection. This fallback is useful context, not proof that a device physically left the network.
+
+The browser displays an indeterminate progress bar while the server prepares or streams an export. When a byte length is available it becomes percentage-based; otherwise the UI reports bytes received. In-progress server downloads can be cancelled.
 
 Every raw row includes:
 
@@ -166,7 +176,7 @@ Fields unavailable in the installed Pi-hole schema are `null`/empty. Raw numeric
 
 ### LLM-ready Markdown
 
-The `LLM report (.md)` action produces a self-describing Markdown evidence bundle suitable for direct upload to ChatGPT Work or local analysis with Codex CLI. Equivalent Markdown actions are available for one service, one review signal, all review signals, and a filtered query-log selection.
+The `LLM evidence report` choice in the export menu produces a self-describing Markdown evidence bundle suitable for direct upload to ChatGPT Work or local analysis with Codex CLI. The same format can be selected for one service, one review signal, all review signals, and a filtered query-log selection.
 
 The file contains:
 

@@ -7,12 +7,15 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .database import SourceUnavailable, connect_readonly
 
 
 UNKNOWN_NAMES = {"", "(unknown)", "unknown", "none", "null"}
+ROME = ZoneInfo("Europe/Rome")
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,107 @@ class NetAlertXSource:
                 else:
                     result[address] = device
         return result
+
+    def presence_events(
+        self,
+        devices: list[dict[str, object]],
+        start_time: float,
+        end_time: float,
+    ) -> tuple[bool, list[dict[str, object]]]:
+        """Return selected NetAlertX connection state changes when its Events table exists.
+
+        NetAlertX has kept the same logical columns across several Pi.Alert-era
+        schemas, but their exact capitalization is not guaranteed. Schema
+        introspection keeps this read-only integration compatible without ever
+        exposing MAC addresses in the API response.
+        """
+        if not start_time < end_time:
+            raise ValueError("invalid time range")
+        with connect_readonly(self.database_path) as connection:
+            table_row = connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND LOWER(name) = 'events'
+                LIMIT 1
+                """
+            ).fetchone()
+            if table_row is None:
+                return False, []
+            table = str(table_row["name"])
+            columns = {
+                str(row["name"]).casefold(): str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({_quote_identifier(table)})"
+                )
+            }
+            mac_column = columns.get("eve_mac")
+            ip_column = columns.get("eve_ip")
+            time_column = columns.get("eve_datetime")
+            type_column = columns.get("eve_eventtype")
+            info_column = columns.get("eve_additionalinfo")
+            if not mac_column or not time_column or not type_column:
+                return False, []
+
+            ip_expression = _quote_identifier(ip_column) if ip_column else "NULL"
+            info_expression = _quote_identifier(info_column) if info_column else "NULL"
+            start_local = datetime.fromtimestamp(start_time, ROME).strftime("%Y-%m-%d %H:%M:%S")
+            end_local = datetime.fromtimestamp(end_time, ROME).strftime("%Y-%m-%d %H:%M:%S")
+            rows = connection.execute(
+                f"""
+                SELECT rowid AS event_rowid,
+                       {_quote_identifier(mac_column)} AS event_mac,
+                       {ip_expression} AS event_ip,
+                       {_quote_identifier(time_column)} AS event_time,
+                       {_quote_identifier(type_column)} AS event_type,
+                       {info_expression} AS event_info
+                FROM {_quote_identifier(table)}
+                WHERE datetime({_quote_identifier(time_column)}) >= datetime(?)
+                  AND datetime({_quote_identifier(time_column)}) < datetime(?)
+                ORDER BY datetime({_quote_identifier(time_column)}), rowid
+                """,
+                (start_local, end_local),
+            ).fetchall()
+
+        devices_by_id = {str(device["id"]): device for device in devices}
+        devices_by_address = {
+            _normalize_address(str(address)): device
+            for device in devices
+            for address in list(device.get("addresses") or [device.get("address")])
+            if address
+        }
+        result: list[dict[str, object]] = []
+        for row in rows:
+            state = _presence_state(row["event_type"])
+            if state is None:
+                continue
+            stable_mac = _stable_hardware_key(row["event_mac"])
+            matched = (
+                devices_by_id.get(device_id(f"hardware:{stable_mac}"))
+                if stable_mac
+                else None
+            )
+            if matched is None and row["event_ip"]:
+                matched = devices_by_address.get(_normalize_address(str(row["event_ip"])))
+            if matched is None:
+                continue
+            epoch = _netalertx_epoch(row["event_time"])
+            if epoch is None or not start_time <= epoch < end_time:
+                continue
+            result.append(
+                {
+                    "event_id": f"netalertx:{row['event_rowid']}",
+                    "timestamp_epoch": int(epoch) if epoch.is_integer() else epoch,
+                    "timestamp_local": datetime.fromtimestamp(epoch, ROME).isoformat(timespec="seconds"),
+                    "timezone": "Europe/Rome",
+                    "canonical_device_id": matched["id"],
+                    "device_name": matched["display_name"],
+                    "state": state,
+                    "source": "netalertx",
+                    "confidence": "observed",
+                    "detail": str(row["event_info"] or row["event_type"] or ""),
+                }
+            )
+        return True, result
 
 
 class PiHoleSource:
@@ -466,6 +570,34 @@ def _extract_addresses(*values: object) -> set[str]:
                 continue
             addresses.add(normalized)
     return addresses
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _presence_state(value: object) -> str | None:
+    event_type = str(value or "").strip().casefold()
+    if any(marker in event_type for marker in ("reconnect", "new device")):
+        return "connected"
+    if any(marker in event_type for marker in ("disconnect", "device down", "down")):
+        return "disconnected"
+    if "connect" in event_type:
+        return "connected"
+    return None
+
+
+def _netalertx_epoch(value: object) -> float | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ROME)
+    return parsed.timestamp()
 
 
 def _selector_matches(selector: str, address: str, hardware_address: str) -> bool:
