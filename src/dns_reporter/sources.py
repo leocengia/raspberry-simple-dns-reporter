@@ -5,17 +5,22 @@ import ipaddress
 import re
 import sqlite3
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .database import SourceUnavailable, connect_readonly
 
 
 UNKNOWN_NAMES = {"", "(unknown)", "unknown", "none", "null"}
+ROME = ZoneInfo("Europe/Rome")
 
 
 @dataclass(frozen=True)
 class NetAlertDevice:
+    stable_key: str | None
     name: str
     vendor: str
     device_type: str
@@ -30,9 +35,14 @@ class NetAlertXSource:
 
     def devices_by_address(self) -> dict[str, NetAlertDevice]:
         with connect_readonly(self.database_path) as connection:
+            columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(Devices)")
+            }
+            mac_expression = "devMac" if "devMac" in columns else "NULL"
             rows = connection.execute(
-                """
-                SELECT devName, devVendor, devType, devPresentLastScan,
+                f"""
+                SELECT {mac_expression} AS stable_mac,
+                       devName, devVendor, devType, devPresentLastScan,
                        devLastConnection, devLastIP, devPrimaryIPv4,
                        devPrimaryIPv6
                 FROM Devices
@@ -41,11 +51,13 @@ class NetAlertXSource:
             ).fetchall()
 
         result: dict[str, NetAlertDevice] = {}
+        ambiguous_addresses: set[str] = set()
         for row in rows:
             addresses = _extract_addresses(
                 row["devLastIP"], row["devPrimaryIPv4"], row["devPrimaryIPv6"]
             )
             device = NetAlertDevice(
+                stable_key=_stable_hardware_key(row["stable_mac"]),
                 name=_clean_name(row["devName"]),
                 vendor=(row["devVendor"] or "").strip(),
                 device_type=(row["devType"] or "").strip(),
@@ -54,8 +66,116 @@ class NetAlertXSource:
                 addresses=frozenset(addresses),
             )
             for address in addresses:
-                result[address] = device
+                if address in ambiguous_addresses:
+                    continue
+                existing = result.get(address)
+                if existing is not None and existing != device:
+                    result.pop(address, None)
+                    ambiguous_addresses.add(address)
+                else:
+                    result[address] = device
         return result
+
+    def presence_events(
+        self,
+        devices: list[dict[str, object]],
+        start_time: float,
+        end_time: float,
+    ) -> tuple[bool, list[dict[str, object]]]:
+        """Return selected NetAlertX connection state changes when its Events table exists.
+
+        NetAlertX has kept the same logical columns across several Pi.Alert-era
+        schemas, but their exact capitalization is not guaranteed. Schema
+        introspection keeps this read-only integration compatible without ever
+        exposing MAC addresses in the API response.
+        """
+        if not start_time < end_time:
+            raise ValueError("invalid time range")
+        with connect_readonly(self.database_path) as connection:
+            table_row = connection.execute(
+                """
+                SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND LOWER(name) = 'events'
+                LIMIT 1
+                """
+            ).fetchone()
+            if table_row is None:
+                return False, []
+            table = str(table_row["name"])
+            columns = {
+                str(row["name"]).casefold(): str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({_quote_identifier(table)})"
+                )
+            }
+            mac_column = columns.get("eve_mac")
+            ip_column = columns.get("eve_ip")
+            time_column = columns.get("eve_datetime")
+            type_column = columns.get("eve_eventtype")
+            info_column = columns.get("eve_additionalinfo")
+            if not mac_column or not time_column or not type_column:
+                return False, []
+
+            ip_expression = _quote_identifier(ip_column) if ip_column else "NULL"
+            info_expression = _quote_identifier(info_column) if info_column else "NULL"
+            start_local = datetime.fromtimestamp(start_time, ROME).strftime("%Y-%m-%d %H:%M:%S")
+            end_local = datetime.fromtimestamp(end_time, ROME).strftime("%Y-%m-%d %H:%M:%S")
+            rows = connection.execute(
+                f"""
+                SELECT rowid AS event_rowid,
+                       {_quote_identifier(mac_column)} AS event_mac,
+                       {ip_expression} AS event_ip,
+                       {_quote_identifier(time_column)} AS event_time,
+                       {_quote_identifier(type_column)} AS event_type,
+                       {info_expression} AS event_info
+                FROM {_quote_identifier(table)}
+                WHERE datetime({_quote_identifier(time_column)}) >= datetime(?)
+                  AND datetime({_quote_identifier(time_column)}) < datetime(?)
+                ORDER BY datetime({_quote_identifier(time_column)}), rowid
+                """,
+                (start_local, end_local),
+            ).fetchall()
+
+        devices_by_id = {str(device["id"]): device for device in devices}
+        devices_by_address = {
+            _normalize_address(str(address)): device
+            for device in devices
+            for address in list(device.get("addresses") or [device.get("address")])
+            if address
+        }
+        result: list[dict[str, object]] = []
+        for row in rows:
+            state = _presence_state(row["event_type"])
+            if state is None:
+                continue
+            stable_mac = _stable_hardware_key(row["event_mac"])
+            matched = (
+                devices_by_id.get(device_id(f"hardware:{stable_mac}"))
+                if stable_mac
+                else None
+            )
+            if matched is None and row["event_ip"]:
+                matched = devices_by_address.get(_normalize_address(str(row["event_ip"])))
+            if matched is None:
+                continue
+            epoch = _netalertx_epoch(row["event_time"])
+            if epoch is None or not start_time <= epoch < end_time:
+                continue
+            result.append(
+                {
+                    "event_id": f"netalertx:{row['event_rowid']}",
+                    "timestamp_epoch": int(epoch) if epoch.is_integer() else epoch,
+                    "timestamp_local": datetime.fromtimestamp(epoch, ROME).isoformat(timespec="seconds"),
+                    "timezone": "Europe/Rome",
+                    "canonical_device_id": matched["id"],
+                    "device_name": matched["display_name"],
+                    "state": state,
+                    "source": "netalertx",
+                    "confidence": "observed",
+                    "detail": str(row["event_info"] or row["event_type"] or ""),
+                }
+            )
+        return True, result
 
 
 class PiHoleSource:
@@ -94,26 +214,53 @@ class PiHoleSource:
             netalert_devices = {}
             netalert_available = False
 
-        devices: list[dict[str, object]] = []
+        hardware_by_address = self._hardware_by_address()
+        grouped: dict[str, dict[str, object]] = {}
         for row in rows:
             address = str(row["client"])
-            netalert = netalert_devices.get(_normalize_address(address))
+            normalized = _normalize_address(address)
+            netalert = netalert_devices.get(normalized)
             pihole_name = _clean_name(row["pihole_name"])
-            display_name = pihole_name or (netalert.name if netalert else "") or address
-            devices.append(
+            # NetAlertX contains the user-confirmed inventory names. Pi-hole
+            # hostnames are useful fallbacks but are often generic (for example
+            # ``iPhone.lan``) and make multi-device/LLM reports ambiguous.
+            display_name = (netalert.name if netalert else "") or pihole_name or address
+            hardware_key = _stable_hardware_key(hardware_by_address.get(normalized))
+            stable_key = (netalert.stable_key if netalert else None) or hardware_key
+            canonical_key = f"hardware:{stable_key}" if stable_key else f"client:{normalized}"
+            item = grouped.setdefault(
+                canonical_key,
                 {
-                    "id": device_id(address),
+                    "id": device_id(canonical_key),
                     "display_name": display_name,
                     "address": address,
-                    "query_count": int(row["query_count"]),
-                    "last_seen": float(row["last_seen"]),
+                    "addresses": [],
+                    "query_count": 0,
+                    "last_seen": 0.0,
                     "vendor": netalert.vendor if netalert else "",
                     "device_type": netalert.device_type if netalert else "",
                     "present": netalert.present if netalert else None,
                     "netalertx_match": bool(netalert),
                     "netalertx_available": netalert_available,
-                }
+                    "identity_confidence": "high" if stable_key else "low",
+                },
             )
+            item["addresses"].append(address)  # type: ignore[union-attr]
+            item["query_count"] = int(item["query_count"]) + int(row["query_count"])
+            if float(row["last_seen"]) >= float(item["last_seen"]):
+                item["last_seen"] = float(row["last_seen"])
+                item["address"] = address
+                if pihole_name or not item["display_name"]:
+                    item["display_name"] = display_name
+
+        devices = sorted(grouped.values(), key=lambda item: float(item["last_seen"]), reverse=True)
+        duplicate_names: dict[str, int] = {}
+        for device in devices:
+            key = str(device["display_name"]).casefold()
+            duplicate_names[key] = duplicate_names.get(key, 0) + 1
+        for device in devices:
+            if duplicate_names[str(device["display_name"]).casefold()] > 1:
+                device["display_name"] = f"{device['display_name']} · {str(device['id'])[-4:].upper()}"
         return devices
 
     def resolve_device(self, opaque_id: str) -> dict[str, object] | None:
@@ -174,12 +321,13 @@ class PiHoleSource:
                 if any(
                     _selector_matches(
                         selector,
-                        str(device["address"]),
+                        address,
                         hardware_by_address.get(
-                            _normalize_address(str(device["address"])), ""
+                            _normalize_address(address), ""
                         ),
                     )
                     for selector in selectors
+                    for address in list(device.get("addresses") or [device["address"]])
                 )
             ]
             result.append(
@@ -203,24 +351,68 @@ class PiHoleSource:
         hours: int,
         end_time: float | None = None,
     ) -> list[dict[str, object]]:
-        unique_clients = list(dict.fromkeys(clients))
-        if not unique_clients or len(unique_clients) > 64:
-            raise ValueError("between 1 and 64 clients are required")
         end = end_time or time.time()
-        cutoff = end - hours * 3600
-        placeholders = ",".join("?" for _ in unique_clients)
+        return list(self.query_range(clients, end - hours * 3600, end))
+
+    def query_range(
+        self,
+        clients: list[str],
+        start_time: float,
+        end_time: float,
+        *,
+        descending: bool = False,
+        chunk_size: int = 1000,
+    ) -> Iterator[dict[str, object]]:
+        unique_clients = list(dict.fromkeys(clients))
+        if not unique_clients or len(unique_clients) > 128:
+            raise ValueError("between 1 and 128 clients are required")
+        if not start_time < end_time:
+            raise ValueError("invalid time range")
+        return self._query_range_iterator(
+            unique_clients, start_time, end_time, descending, chunk_size
+        )
+
+    def _query_range_iterator(
+        self,
+        clients: list[str],
+        start_time: float,
+        end_time: float,
+        descending: bool,
+        chunk_size: int,
+    ) -> Iterator[dict[str, object]]:
+        placeholders = ",".join("?" for _ in clients)
+        direction = "DESC" if descending else "ASC"
         with connect_readonly(self.database_path) as connection:
-            rows = connection.execute(
+            columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(queries)")
+            }
+            optional = {
+                "query_id": "id" if "id" in columns else "rowid",
+                "query_type": "type" if "type" in columns else "NULL",
+                "reply_type": "reply_type" if "reply_type" in columns else "NULL",
+                "reply_time": "reply_time" if "reply_time" in columns else "NULL",
+                "forward": "forward" if "forward" in columns else "NULL",
+                "list_id": "list_id" if "list_id" in columns else "NULL",
+            }
+            cursor = connection.execute(
                 f"""
-                SELECT timestamp, status, domain, client
+                SELECT {optional['query_id']} AS query_id,
+                       timestamp, {optional['query_type']} AS query_type,
+                       status, domain, client,
+                       {optional['reply_type']} AS reply_type,
+                       {optional['reply_time']} AS reply_time,
+                       {optional['forward']} AS forward,
+                       {optional['list_id']} AS list_id
                 FROM queries
-                WHERE timestamp >= ? AND timestamp <= ?
+                WHERE timestamp >= ? AND timestamp < ?
                   AND client IN ({placeholders})
-                ORDER BY timestamp
+                ORDER BY timestamp {direction}, query_id {direction}
                 """,
-                (cutoff, end, *unique_clients),
-            ).fetchall()
-        return [dict(row) for row in rows]
+                (start_time, end_time, *clients),
+            )
+            while rows := cursor.fetchmany(chunk_size):
+                for row in rows:
+                    yield dict(row)
 
     def historical_context(
         self,
@@ -230,12 +422,28 @@ class PiHoleSource:
         baseline_days: int = 7,
     ) -> dict[str, object]:
         unique_clients = list(dict.fromkeys(clients))
-        if not unique_clients or len(unique_clients) > 64:
-            raise ValueError("between 1 and 64 clients are required")
+        if not unique_clients or len(unique_clients) > 128:
+            raise ValueError("between 1 and 128 clients are required")
         current_start = end_time - hours * 3600
         baseline_start = current_start - baseline_days * 86400
+        return self.historical_context_range(
+            unique_clients, baseline_start, current_start, baseline_days
+        )
+
+    def historical_context_range(
+        self,
+        clients: list[str],
+        baseline_start: float,
+        baseline_end: float,
+        baseline_days: int = 7,
+    ) -> dict[str, object]:
+        unique_clients = list(dict.fromkeys(clients))
+        if not unique_clients or len(unique_clients) > 128:
+            raise ValueError("between 1 and 128 clients are required")
+        if not baseline_start < baseline_end:
+            raise ValueError("invalid baseline range")
         placeholders = ",".join("?" for _ in unique_clients)
-        parameters = (baseline_start, current_start, *unique_clients)
+        parameters = (baseline_start, baseline_end, *unique_clients)
         with connect_readonly(self.database_path) as connection:
             domain_rows = connection.execute(
                 f"""
@@ -262,7 +470,7 @@ class PiHoleSource:
         return {
             "baseline_days": baseline_days,
             "start": baseline_start,
-            "end": current_start,
+            "end": baseline_end,
             "domain_counts": {
                 str(row["domain"] or "").lower().rstrip("."): int(row["query_count"])
                 for row in domain_rows
@@ -280,11 +488,28 @@ class PiHoleSource:
     def _hardware_by_address(self) -> dict[str, str]:
         try:
             with connect_readonly(self.database_path) as connection:
+                address_columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(network_addresses)")
+                }
+                recency_order = (
+                    "lastSeen DESC, network_id DESC"
+                    if "lastSeen" in address_columns
+                    else "network_id DESC"
+                )
                 rows = connection.execute(
-                    """
-                    SELECT a.ip, n.hwaddr
-                    FROM network_addresses AS a
-                    JOIN network AS n ON n.id = a.network_id
+                    f"""
+                    SELECT recent.ip, n.hwaddr
+                    FROM (
+                        SELECT ip, network_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY ip
+                                   ORDER BY {recency_order}
+                               ) AS position
+                        FROM network_addresses
+                    ) AS recent
+                    JOIN network AS n ON n.id = recent.network_id
+                    WHERE recent.position = 1
                     """
                 ).fetchall()
         except (SourceUnavailable, sqlite3.Error):
@@ -297,6 +522,17 @@ class PiHoleSource:
 
 def device_id(address: str) -> str:
     return hashlib.sha256(address.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_hardware_key(value: object) -> str | None:
+    candidate = str(value or "").strip().lower().replace("-", ":")
+    if not candidate or candidate in {"00:00:00:00:00:00", "(unknown)"}:
+        return None
+    if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", candidate):
+        return candidate
+    if re.fullmatch(r"[0-9a-f]{12}", candidate):
+        return ":".join(candidate[index:index + 2] for index in range(0, 12, 2))
+    return None
 
 
 def group_id(numeric_id: int) -> str:
@@ -334,6 +570,34 @@ def _extract_addresses(*values: object) -> set[str]:
                 continue
             addresses.add(normalized)
     return addresses
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _presence_state(value: object) -> str | None:
+    event_type = str(value or "").strip().casefold()
+    if any(marker in event_type for marker in ("reconnect", "new device")):
+        return "connected"
+    if any(marker in event_type for marker in ("disconnect", "device down", "down")):
+        return "disconnected"
+    if "connect" in event_type:
+        return "connected"
+    return None
+
+
+def _netalertx_epoch(value: object) -> float | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ROME)
+    return parsed.timestamp()
 
 
 def _selector_matches(selector: str, address: str, hardware_address: str) -> bool:

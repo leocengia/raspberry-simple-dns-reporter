@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 
@@ -13,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from dns_reporter.classifier import DomainClassifier  # noqa: E402
 from dns_reporter.database import BLOCKED_STATUSES, connect_readonly  # noqa: E402
-from dns_reporter.report import build_report  # noqa: E402
+from dns_reporter.report import _bucket_range, build_report  # noqa: E402
 from dns_reporter.sources import (  # noqa: E402
     NetAlertXSource,
     PiHoleSource,
@@ -40,14 +41,20 @@ class ReporterTestCase(unittest.TestCase):
 
     def _create_pihole_fixture(self) -> None:
         now = time.time()
-        with sqlite3.connect(self.pihole_db) as connection:
+        with closing(sqlite3.connect(self.pihole_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE queries (
+                    id INTEGER PRIMARY KEY,
                     timestamp REAL NOT NULL,
+                    type INTEGER,
                     status INTEGER NOT NULL,
                     domain TEXT NOT NULL,
-                    client TEXT NOT NULL
+                    client TEXT NOT NULL,
+                    forward TEXT,
+                    reply_type INTEGER,
+                    reply_time REAL,
+                    list_id INTEGER
                 );
                 CREATE TABLE client_by_id (
                     id INTEGER PRIMARY KEY,
@@ -93,7 +100,7 @@ class ReporterTestCase(unittest.TestCase):
             )
 
     def _create_netalertx_fixture(self) -> None:
-        with sqlite3.connect(self.netalertx_db) as connection:
+        with closing(sqlite3.connect(self.netalertx_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE Devices (
@@ -125,7 +132,7 @@ class ReporterTestCase(unittest.TestCase):
             )
 
     def _create_gravity_fixture(self) -> None:
-        with sqlite3.connect(self.gravity_db) as connection:
+        with closing(sqlite3.connect(self.gravity_db)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE "group" (
@@ -150,6 +157,7 @@ class ReporterTestCase(unittest.TestCase):
 
     def test_readonly_connection_rejects_writes(self) -> None:
         with connect_readonly(self.pihole_db) as connection:
+            self.assertEqual(connection.execute("PRAGMA temp_store").fetchone()[0], 2)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM queries").fetchone()[0], 6)
             with self.assertRaises(sqlite3.OperationalError):
                 connection.execute("DELETE FROM queries")
@@ -173,7 +181,7 @@ class ReporterTestCase(unittest.TestCase):
         self.assertEqual(phone["display_name"], "Test phone")
         self.assertEqual(phone["vendor"], "Example vendor")
         self.assertTrue(phone["netalertx_match"])
-        self.assertEqual(phone["id"], device_id("192.0.2.10"))
+        self.assertEqual(phone["id"], device_id("hardware:02:00:00:00:00:10"))
 
     def test_pihole_groups_resolve_to_recent_devices(self) -> None:
         source = PiHoleSource(
@@ -193,6 +201,18 @@ class ReporterTestCase(unittest.TestCase):
         )
         self.assertEqual(historical["domain_counts"], {"known.example": 1})
         self.assertEqual(len(historical["hour_counts"]), 1)
+
+    def test_historical_context_accepts_explicit_calendar_boundaries(self) -> None:
+        source = PiHoleSource(self.pihole_db, NetAlertXSource(self.netalertx_db))
+        end = time.time() - 86400
+        historical = source.historical_context_range(
+            ["192.0.2.10"], end - 2 * 86400, end, baseline_days=2
+        )
+        self.assertEqual(historical["start"], end - 2 * 86400)
+        self.assertEqual(historical["end"], end)
+
+    def test_timeline_does_not_add_bucket_at_exclusive_end(self) -> None:
+        self.assertEqual(_bucket_range(0, 7200, 3600), [0, 3600])
 
     def test_report_metrics_and_service_drilldown(self) -> None:
         classifier = DomainClassifier.from_file(SERVICE_MAP)

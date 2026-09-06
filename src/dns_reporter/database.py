@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -11,10 +13,15 @@ class SourceUnavailable(RuntimeError):
     """Raised when a configured read-only data source cannot be opened."""
 
 
-def connect_readonly(path: Path) -> sqlite3.Connection:
+@contextmanager
+def connect_readonly(path: Path) -> Iterator[sqlite3.Connection]:
     """Open an existing SQLite database without permission to create or write."""
-    resolved = path.resolve()
-    if not resolved.is_file():
+    try:
+        resolved = path.resolve()
+        available = resolved.is_file()
+    except OSError as exc:
+        raise SourceUnavailable(f"Data source unavailable: {path.name}") from exc
+    if not available:
         raise SourceUnavailable(f"Data source unavailable: {resolved.name}")
 
     try:
@@ -26,8 +33,15 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 1000")
-        return connection
+        # The container intentionally has a very small read-only filesystem and
+        # /tmp.  Pi-hole inventory queries need a temporary B-tree; keeping it in
+        # process memory avoids a misleading SQLITE_FULL when /tmp fills up.
+        connection.execute("PRAGMA temp_store = MEMORY")
     except sqlite3.Error as exc:
         raise SourceUnavailable(
             f"Unable to open data source: {resolved.name}"
         ) from exc
+    try:
+        yield connection
+    finally:
+        connection.close()

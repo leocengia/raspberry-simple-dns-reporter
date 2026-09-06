@@ -45,17 +45,29 @@
             <small id="group-hint" class="muted"></small>
           </label>
         </div>
-        <label class="time-control">
-          <span>Time range</span>
-          <select id="hours-select">
-            <option value="3">Last 3h</option>
-            <option value="6">Last 6h</option>
-            <option value="12">Last 12h</option>
-            <option value="24" selected>Last 24h</option>
-            <option value="48">Last 48h</option>
-            <option value="168">Last 7 days</option>
-          </select>
-        </label>
+        <div class="time-control">
+          <span class="control-label">Time range</span>
+          <fieldset class="range-control">
+            <legend>Time range type</legend>
+            <label><input type="radio" name="period-mode" value="rolling" checked> Recent</label>
+            <label><input type="radio" name="period-mode" value="calendar"> Specific day</label>
+          </fieldset>
+          <label id="rolling-control">
+            <span class="visually-hidden">Recent time range</span>
+            <select id="hours-select">
+              <option value="3">Last 3h</option>
+              <option value="6">Last 6h</option>
+              <option value="12">Last 12h</option>
+              <option value="24" selected>Last 24h</option>
+              <option value="48">Last 48h</option>
+              <option value="168">Last 7 days</option>
+            </select>
+          </label>
+          <label id="date-control" hidden>
+            <span class="visually-hidden">Report date</span>
+            <input id="report-date" type="date">
+          </label>
+        </div>
         <button id="generate-button" type="button" disabled>Generate report</button>
       </section>
 
@@ -72,9 +84,7 @@
           <div class="report-actions">
             <p id="generated-at" class="muted generated-at"></p>
             <div>
-              <button type="button" id="download-json">JSON</button>
-              <button type="button" id="download-csv">CSV</button>
-              <button type="button" id="print-report">Print / PDF</button>
+              <button type="button" id="open-export">Export data…</button>
             </div>
           </div>
         </section>
@@ -119,7 +129,9 @@
               <p class="eyebrow">Changes &amp; Red Flags</p>
               <h3>Signals to review</h3>
             </div>
-            <span id="baseline-label" class="chip"></span>
+            <div class="panel-actions">
+              <span id="baseline-label" class="chip"></span>
+            </div>
           </div>
           <div id="signals-list" class="signals-list"></div>
         </section>
@@ -157,14 +169,98 @@
             <button type="button" class="close-button" id="close-detail">Close</button>
           </div>
           <div class="detail-metrics" id="detail-metrics"></div>
+          <p id="infrastructure-note" class="caveat" hidden>
+            Shared infrastructure classification: DNS alone may not identify the originating app.
+          </p>
+          <div class="query-actions">
+            <button type="button" id="view-service-queries">View query log</button>
+          </div>
           <div id="service-chart" class="timeline-chart compact" role="img"></div>
           <div id="device-comparison" class="device-comparison" hidden>
             <h4>Device comparison</h4>
             <div id="device-comparison-list"></div>
           </div>
+          <h4 id="domain-list-title" class="section-label">Top domains</h4>
           <div class="domain-list" id="domain-list"></div>
         </section>
+
+        <section class="panel query-panel" id="query-panel" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Verifiable evidence</p>
+              <h3 id="query-title">Query log</h3>
+              <p id="query-count" class="muted"></p>
+            </div>
+            <button type="button" class="close-button" id="close-query-panel">Close</button>
+          </div>
+          <div class="query-toolbar">
+            <label>Domain contains<input id="query-domain-filter" type="search" maxlength="200" placeholder="example.com"></label>
+            <label>Device<select id="query-device-filter"><option value="">All devices</option></select></label>
+            <label>Time order<select id="query-sort"><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label>
+            <button type="button" id="apply-query-filters">Apply</button>
+          </div>
+          <div class="query-table-wrap">
+            <table class="query-table">
+              <thead><tr><th>Time (Europe/Rome)</th><th>Device</th><th>Domain</th><th>Service / infrastructure</th><th>Status</th></tr></thead>
+              <tbody id="query-rows"></tbody>
+            </table>
+          </div>
+          <p id="query-empty" class="empty-state" hidden>No DNS queries match this selection.</p>
+          <button type="button" id="load-more-queries" class="load-more" hidden>Load more</button>
+          <p class="privacy-note">Exports contain DNS name-resolution events, not full URLs, contents, searches, usage duration, or transferred data.</p>
+        </section>
       </div>
+
+      <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-title">
+        <div class="export-heading">
+          <div>
+            <p class="eyebrow">Download centre</p>
+            <h2 id="export-title">Export data</h2>
+          </div>
+          <button type="button" class="close-button" id="close-export" aria-label="Close export menu">Close</button>
+        </div>
+        <div class="export-form">
+          <label>
+            <span>What to export</span>
+            <select id="export-content">
+              <option value="queries">Complete DNS queries</option>
+              <option value="llm">LLM evidence report</option>
+              <option value="service">Queries for one service</option>
+              <option value="signals">Queries matching review signals</option>
+              <option value="current-query">Current query-log selection</option>
+              <option value="presence">Connections and disconnections</option>
+              <option value="services">Services summary</option>
+              <option value="report-json">Aggregated report data</option>
+              <option value="print">Print / save as PDF</option>
+            </select>
+          </label>
+          <label id="export-service-control" hidden>
+            <span>Service</span>
+            <select id="export-service"></select>
+          </label>
+          <label id="export-signal-control" hidden>
+            <span>Review signal</span>
+            <select id="export-signal"></select>
+          </label>
+          <label>
+            <span>Format</span>
+            <select id="export-format"></select>
+          </label>
+          <div class="export-dates" id="export-dates">
+            <label><span>From</span><input id="export-date-from" type="date"></label>
+            <label><span>To (included)</span><input id="export-date-to" type="date"></label>
+          </div>
+          <p id="export-range-hint" class="muted export-hint"></p>
+        </div>
+        <div id="export-progress-wrap" class="export-progress" hidden>
+          <progress id="export-progress" max="100"></progress>
+          <p id="export-status" aria-live="polite">Preparing export…</p>
+        </div>
+        <div class="export-footer">
+          <button type="button" id="cancel-export">Cancel</button>
+          <button type="button" id="start-export">Download</button>
+        </div>
+      </dialog>
     </main>
   </body>
 </html>

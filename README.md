@@ -10,11 +10,20 @@ The reporter is deliberately **not** a packet sniffer. DNS data can show that a 
 - Multi-device selection and aggregated reports
 - Pi-hole group selection (exact IP, subnet, and MAC selectors)
 - NetAlertX name, vendor, type, and presence enrichment
-- 3h, 6h, 12h, 24h, 48h, and 7-day reports
+- 3h, 6h, 12h, 24h, 48h, and 7-day rolling reports
+- Reports for a specific `Europe/Rome` calendar day, including correct 23/25-hour DST days and the current day so far
 - Total queries, blocked percentage, and unique domains
 - Domain-to-service classification with confidence labels
 - DNS activity timeline
 - Service drill-down with timeline and top domains
+- Timestamped, paginated raw-query drill-down for services and review signals
+- One export menu for complete queries, services, review signals, current filters, and aggregate data
+- Custom inclusive calendar-date ranges (up to 366 days) for raw DNS and presence exports
+- Connection/disconnection exports from NetAlertX, with an explicit DNS-activity estimate fallback
+- Visible, cancellable download progress for server-side exports
+- Streaming CSV and JSONL evidence exports for a service, one signal, or all signals
+- LLM-ready Markdown exports for a whole report or any downloadable evidence slice
+- Stable device identity with safe disambiguation of duplicate display names
 - Per-service comparison between selected devices
 - Seven-day historical baseline with conservative change signals
 - Browser-side JSON, CSV, and print/PDF export
@@ -34,7 +43,7 @@ Browser
   <- HTML, JSON, CSS and JavaScript
 ```
 
-Pi-hole remains the authoritative DNS source. NetAlertX remains active and is only queried for device metadata.
+Pi-hole remains the authoritative DNS source. NetAlertX supplies device metadata and, when its compatible `Events` table is present, connection state changes. Every generated report fixes absolute report and baseline boundaries in `Europe/Rome`; a selected calendar day runs from local midnight to the next local midnight (or to the generation time when selecting today). Subsequent detail and export requests use a short-lived, server-signed snapshot rather than recalculating “now”. Snapshots expire after 24 hours or when the process/classifier version changes, at which point the UI asks for a new report.
 
 ## Requirements
 
@@ -116,12 +125,18 @@ Blocked counts follow Pi-hole's documented status values rather than assuming ev
 
 Rules live in [`src/dns_reporter/config/service_map.json`](src/dns_reporter/config/service_map.json). A rule maps domain suffixes to:
 
+- stable service and rule IDs;
 - service;
 - company;
 - category;
-- confidence (`high`, `likely`, `infrastructure`, or `unknown`).
+- confidence (`high`, `likely`, `infrastructure/ambiguous`, or `unknown`);
+- an optional infrastructure provider.
 
-Infrastructure domains such as AWS, Cloudflare, and Akamai are intentionally not attributed to a specific app. Pull requests that improve conservative, source-backed mappings are welcome.
+Specific rules are ordered before generic infrastructure rules. For example, an Apple/iTunes hostname delivered through Akamai preserves both Apple as the attributable service and Akamai as infrastructure. Opaque Akamai hostnames are shown as `Akamai CDN (shared infrastructure)` and are not evidence that a particular app was used.
+
+## Device identity
+
+The Reporter never groups devices by hostname. It prefers a stable NetAlertX/Pi-hole hardware identity, then falls back to the raw Pi-hole client. Multiple observed IPv4/IPv6 addresses are combined only when a shared stable identity supports the association. Distinct devices with the same hostname remain separate and receive a short stable suffix in the UI. Raw client/IP and identity confidence remain available in query details and exports.
 
 ## Changes and review signals
 
@@ -136,9 +151,56 @@ never existed or is malicious.
 
 ## Export behavior
 
-JSON, CSV, and print/PDF outputs are created by the browser from the report already
-received. The server does not persist generated reports or create export files on
-the Raspberry Pi.
+The report header has one download centre instead of format buttons scattered across individual sections. It can export complete DNS queries, an LLM evidence bundle, one service, all or one review signal, the currently filtered query log, connection state changes, the service summary, aggregate JSON, or print/PDF.
+
+Raw query evidence uses `POST /api/exports/queries` and is serialized incrementally from read-only SQLite rows; the server does not persist files or materialize the complete export in memory. Supported scopes are the whole selected device set, one `signal_id`, all signals (deduplicated by Pi-hole query ID), or one stable `service_id`. Formats are UTF-8 CSV, JSONL/NDJSON, and LLM-ready Markdown. Complete-query, service, LLM, and presence exports accept an inclusive `date_from`/`date_to` calendar range in `Europe/Rome`, limited to 366 days and capped at the current time for today.
+
+`POST /api/exports/presence` produces a compact CSV or JSONL connection/disconnection history. When NetAlertX exposes a compatible `Events` table, rows are marked `source=netalertx` and `confidence=observed`. If that table is unavailable, the Reporter falls back to conservative DNS-activity sessions: a 30-minute gap becomes an estimated disconnection and later activity an estimated reconnection. This fallback is useful context, not proof that a device physically left the network.
+
+The browser displays an indeterminate progress bar while the server prepares or streams an export. When a byte length is available it becomes percentage-based; otherwise the UI reports bytes received. In-progress server downloads can be cancelled.
+
+Every raw row includes:
+
+```text
+query_id, timestamp_local, timestamp_utc, timestamp_epoch, timezone,
+canonical_device_id, device_name, device_identity_confidence, client_key,
+client_ip, domain, service_id, service_name, company, category,
+infrastructure_provider, classification_confidence, classification_rule_id,
+classification_version, query_type_raw, query_type_label, status_raw,
+status_label, blocked, reply_type_raw, reply_type_label, reply_time, forward,
+list_id, signal_ids, signal_types, report_start_local, report_end_local,
+baseline_start_local, baseline_end_local
+```
+
+Fields unavailable in the installed Pi-hole schema are `null`/empty. Raw numeric codes are retained; labels are omitted unless the Reporter can state them safely. CSV values beginning with spreadsheet formula characters are prefixed with an apostrophe for safe opening; JSONL retains the original text. Timestamps use epoch seconds plus unambiguous UTC and `Europe/Rome` ISO-8601 forms, including DST offsets.
+
+### LLM-ready Markdown
+
+The `LLM evidence report` choice in the export menu produces a self-describing Markdown evidence bundle suitable for direct upload to ChatGPT Work or local analysis with Codex CLI. The same format can be selected for one service, one review signal, all review signals, and a filtered query-log selection.
+
+The file contains:
+
+- a machine-readable schema/version, report boundaries, timezone, scope, devices, and classifier version;
+- an analysis contract that states what DNS evidence can and cannot prove;
+- aggregate metrics, ranked services, top domains, and conservative review signals;
+- chronological JSONL activity grouped into five-minute buckets by device and service;
+- exact first/last query timestamps, allowed/blocked counts, infrastructure attribution, classification confidence, and matching signal IDs/types;
+- six-hour section boundaries so a long report can be analyzed in manageable chunks.
+
+Five-minute grouping keeps repeated DNS chatter compact without losing the useful temporal bounds. The raw CSV and JSONL exports remain the authoritative per-query evidence when an exact event-by-event audit is needed. The Markdown export never includes the short-lived report snapshot token.
+
+Codex CLI can inspect a downloaded bundle with read-only filesystem access. For example:
+
+```sh
+codex exec --sandbox read-only --skip-git-repo-check --cd /path/to/reports \
+  "Analyze ./homeshield_llm-report_DEVICE_DATE.md. Follow the embedded Analysis contract, prioritize review signals and unknown/shared-infrastructure activity, and cite exact local intervals and domains."
+```
+
+`codex exec` is the supported non-interactive CLI workflow; `--cd` selects the report directory and `--sandbox read-only` prevents filesystem changes. See the [official Codex CLI command reference](https://developers.openai.com/codex/cli/reference).
+
+DNS bundles contain private browsing metadata. They remain local until the user explicitly gives the file to Codex, ChatGPT Work, or another service.
+
+`POST /api/queries` provides the same evidence as a bounded page (maximum 100 rows) for the UI. Both endpoints accept only server-issued snapshot tokens, known scopes/IDs, bounded text filters, known device IDs, and fixed report windows. They never accept SQL, regular expressions, or raw database predicates.
 
 ## Security and privacy
 
@@ -149,6 +211,7 @@ DNS history is sensitive. The application has no built-in user authentication in
 - Restrict it to a trusted LAN, VPN, Tailscale, or authenticated reverse proxy.
 - Never commit databases, `.env` files, logs, device exports, IP addresses, MAC addresses, tokens, or Pi-hole/NetAlertX configuration.
 - The API sends `Cache-Control: no-store` and identity-bearing report selections use a JSON POST body instead of URL query parameters.
+- Raw exports contain personal DNS history. Download and share them only as sensitive files.
 
 The repository's `.gitignore` and `.dockerignore` reject common database and secret-bearing files, but they are not a substitute for reviewing every commit.
 
